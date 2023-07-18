@@ -1284,22 +1284,30 @@ async def get_leaderboard_scores(
     scoring_metric: Literal["pp", "score"],
 ) -> tuple[list[Mapping[str, Any]], Optional[Mapping[str, Any]]]:
     query = [
-        f"SELECT s.id, s.{scoring_metric} AS _score, "
+        f"SELECT s.id, t._score, "
         "s.max_combo, s.n50, s.n100, s.n300, "
         "s.nmiss, s.nkatu, s.ngeki, s.perfect, s.mods, "
         "UNIX_TIMESTAMP(s.play_time) time, u.id userid, "
         "COALESCE(CONCAT('[', c.tag, '] ', u.name), u.name) AS name "
         "FROM scores s "
+        "INNER JOIN ("
+        f"   SELECT s.userid, MAX(s.{scoring_metric}) as _score "
+        "    FROM scores s "
+        "    WHERE s.map_md5 = :map_md5 AND s.status != 0 ",
+
+        # space to allow for mods condition to be optionally inserted
+        "    GROUP BY s.userid "
+        f") t ON s.userid = t.userid AND s.{scoring_metric} = t._score "
         "INNER JOIN users u ON u.id = s.userid "
         "LEFT JOIN clans c ON c.id = u.clan_id "
-        "WHERE s.map_md5 = :map_md5 AND s.status = 2 "  # 2: =best score
-        "AND (u.priv & 1 OR u.id = :user_id) AND mode = :mode",
+        "WHERE s.mode = :mode AND (u.priv & 1 OR u.id = :user_id)"
     ]
 
     params = {"map_md5": map_md5, "user_id": player.id, "mode": mode}
 
     if leaderboard_type == LeaderboardType.Mods:
         query.append("AND s.mods = :mods")
+        query.insert(1, "AND s.mods = :mods")
         params["mods"] = mods
     elif leaderboard_type == LeaderboardType.Friends:
         query.append("AND s.userid IN :friends")
