@@ -1859,7 +1859,8 @@ async def register_account(
     # are safe for registration.
     errors: Mapping[str, list[str]] = defaultdict(list)
 
-    errors["username"].append("Account creation is currently locked.")
+    if app.settings.LOCK_ACCOUNT_CREATION:
+        errors["username"].append("Account creation is currently locked.")
 
     # Usernames must:
     # - be within 2-15 characters in length
