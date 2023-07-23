@@ -371,7 +371,7 @@ async def api_get_player_scores(
     user_id: Optional[int] = Query(None, alias="id", ge=3, le=2_147_483_647),
     username: Optional[str] = Query(None, alias="name", regex=regexes.USERNAME.pattern),
     mods_arg: Optional[str] = Query(None, alias="mods"),
-    mode_arg: int = Query(0, alias="mode", ge=0, le=11),
+    mode_arg: Optional[int] = Query(None, alias="mode", ge=0, le=11),
     limit: int = Query(25, ge=1, le=100),
     include_loved: bool = False,
     include_failed: bool = True,
@@ -412,8 +412,6 @@ async def api_get_player_scores(
 
     # parse args (scope, mode, mods, limit)
 
-    mode = GameMode(mode_arg)
-
     if mods_arg is not None:
         if mods_arg[0] in ("~", "="):  # weak/strong equality
             strong_equality = mods_arg[0] == "="
@@ -438,13 +436,16 @@ async def api_get_player_scores(
         "t.status, t.mode, t.play_time, t.time_elapsed, t.perfect "
         "FROM scores t "
         "INNER JOIN maps b ON t.map_md5 = b.md5 "
-        "WHERE t.userid = :user_id AND t.mode = :mode",
+        "WHERE t.userid = :user_id",
     ]
 
     params: dict[str, object] = {
         "user_id": player.id,
-        "mode": mode,
     }
+
+    if mode_arg is not None:
+        query.append("AND t.mode = :mode")
+        params["mode"] = GameMode(mode_arg)
 
     if mods is not None:
         if strong_equality:  # type: ignore
