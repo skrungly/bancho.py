@@ -22,6 +22,7 @@ from fastapi.param_functions import Header
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse
 
+import app.discord
 import app.packets
 import app.settings
 import app.state
@@ -404,6 +405,42 @@ class SendMessage(BasePacket):
                         "mode_vn": mode_vn,
                         "timeout": time.time() + 300,  # /np's last 5mins
                     }
+
+                    webhook_url = app.settings.DISCORD_CHAT_WEBHOOK
+                    if recipient == "#osu" and webhook_url:
+                        author = app.discord.Author(
+                            name=player.name,
+                            url=player.url,
+                            icon_url=player.avatar_url,
+                        )
+
+                        diff_str = f"{bmap.diff}*"
+                        duration_str = f"{bmap.total_length // 60}:{bmap.total_length % 60}"
+                        mode_str = repr(GameMode(mode_vn)).replace("vn", "osu")
+
+                        fields = [
+                            app.discord.Field(name="difficulty", value=diff_str, inline=True),
+                            app.discord.Field(name="duration", value=duration_str, inline=True),
+                            app.discord.Field(name="mode", value=mode_str, inline=True),
+                        ]
+
+                        thumbnail = app.discord.Thumbnail(
+                            # TODO: this could be changed if a private map mirror is made.
+                            url=f"https://b.ppy.sh/thumb/{bmap.set_id}l.jpg"
+                        )
+
+                        embed = app.discord.Embed(
+                            title=bmap.full_name,
+                            color=0xff66aa,  # osu!pink
+                            url=bmap.url,
+                            thumbnail=thumbnail,
+                            author=author,
+                            fields=fields,
+                        )
+
+                        webhook = app.discord.Webhook(webhook_url, embeds=[embed])
+                        await webhook.post(app.state.services.http_client)
+
                 else:
                     # time out their previous /np
                     player.last_np = None
