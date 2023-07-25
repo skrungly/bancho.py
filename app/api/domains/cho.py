@@ -414,7 +414,7 @@ class SendMessage(BasePacket):
                             icon_url=player.avatar_url,
                         )
 
-                        diff_str = f"{bmap.diff}*"
+                        diff_str = f"{bmap.diff:.02f}*"
                         duration_str = f"{bmap.total_length // 60}:{bmap.total_length % 60}"
                         mode_str = repr(GameMode(mode_vn)).replace("vn", "osu")
 
