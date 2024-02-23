@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import app.packets
@@ -9,8 +9,6 @@ from app.constants.privileges import Privileges
 
 if TYPE_CHECKING:
     from app.objects.player import Player
-
-__all__ = ("Channel",)
 
 
 class Channel:

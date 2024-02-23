@@ -2,26 +2,60 @@ from __future__ import annotations
 
 import textwrap
 from typing import Any
-from typing import Optional
+from typing import TypedDict
+from typing import cast
+
+from sqlalchemy import Column
+from sqlalchemy import Index
+from sqlalchemy import Integer
+from sqlalchemy import String
+from sqlalchemy import delete
+from sqlalchemy import func
+from sqlalchemy import insert
+from sqlalchemy import select
+from sqlalchemy import update
+from sqlalchemy.dialects.mysql import TINYINT
 
 import app.state.services
+from app._typing import UNSET
+from app._typing import _UnsetSentinel
+from app.repositories import DIALECT
+from app.repositories import Base
 
-# +------------+--------------+------+-----+---------+----------------+
-# | Field      | Type         | Null | Key | Default | Extra          |
-# +------------+--------------+------+-----+---------+----------------+
-# | id         | int          | NO   | PRI | NULL    | auto_increment |
-# | name       | varchar(32)  | NO   | UNI | NULL    |                |
-# | topic      | varchar(256) | NO   |     | NULL    |                |
-# | read_priv  | int          | NO   |     | 1       |                |
-# | write_priv | int          | NO   |     | 2       |                |
-# | auto_join  | tinyint(1)   | NO   |     | 0       |                |
-# +------------+--------------+------+-----+---------+----------------+
 
-READ_PARAMS = textwrap.dedent(
-    """\
-        id, name, topic, read_priv, write_priv, auto_join
-    """,
+class ChannelsTable(Base):
+    __tablename__ = "channels"
+
+    id = Column("id", Integer, primary_key=True)
+    name = Column("name", String(32), nullable=False)
+    topic = Column("topic", String(256), nullable=False)
+    read_priv = Column("read_priv", Integer, nullable=False, server_default="1")
+    write_priv = Column("write_priv", Integer, nullable=False, server_default="2")
+    auto_join = Column("auto_join", TINYINT(1), nullable=False, server_default="0")
+
+    __table_args__ = (
+        Index("channels_name_uindex", name, unique=True),
+        Index("channels_auto_join_index", auto_join),
+    )
+
+
+READ_PARAMS = (
+    ChannelsTable.id,
+    ChannelsTable.name,
+    ChannelsTable.topic,
+    ChannelsTable.read_priv,
+    ChannelsTable.write_priv,
+    ChannelsTable.auto_join,
 )
+
+
+class Channel(TypedDict):
+    id: int
+    name: str
+    topic: str
+    read_priv: int
+    write_priv: int
+    auto_join: bool
 
 
 async def create(
@@ -30,176 +64,146 @@ async def create(
     read_priv: int,
     write_priv: int,
     auto_join: bool,
-) -> dict[str, Any]:
+) -> Channel:
     """Create a new channel."""
-    query = """\
-        INSERT INTO channels (name, topic, read_priv, write_priv, auto_join)
-             VALUES (:name, :topic, :read_priv, :write_priv, :auto_join)
+    insert_stmt = insert(ChannelsTable).values(
+        name=name,
+        topic=topic,
+        read_priv=read_priv,
+        write_priv=write_priv,
+        auto_join=auto_join,
+    )
+    compiled = insert_stmt.compile(dialect=DIALECT)
+    rec_id = await app.state.services.database.execute(str(compiled), compiled.params)
 
-    """
-    params = {
-        "name": name,
-        "topic": topic,
-        "read_priv": read_priv,
-        "write_priv": write_priv,
-        "auto_join": auto_join,
-    }
-    rec_id = await app.state.services.database.execute(query, params)
+    select_stmt = select(READ_PARAMS).where(ChannelsTable.id == rec_id)
+    compiled = select_stmt.compile(dialect=DIALECT)
+    channel = await app.state.services.database.fetch_one(
+        str(compiled),
+        compiled.params,
+    )
 
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM channels
-         WHERE id = :id
-    """
-    params = {
-        "id": rec_id,
-    }
-
-    rec = await app.state.services.database.fetch_one(query, params)
-    assert rec is not None
-    return dict(rec)
+    assert channel is not None
+    return cast(Channel, dict(channel._mapping))
 
 
 async def fetch_one(
-    id: Optional[int] = None,
-    name: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
+    id: int | None = None,
+    name: str | None = None,
+) -> Channel | None:
     """Fetch a single channel."""
     if id is None and name is None:
         raise ValueError("Must provide at least one parameter.")
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM channels
-         WHERE id = COALESCE(:id, id)
-           AND name = COALESCE(:name, name)
-    """
-    params = {
-        "id": id,
-        "name": name,
-    }
 
-    rec = await app.state.services.database.fetch_one(query, params)
-    return dict(rec) if rec is not None else None
+    select_stmt = select(READ_PARAMS)
+
+    if id is not None:
+        select_stmt = select_stmt.where(ChannelsTable.id == id)
+    if name is not None:
+        select_stmt = select_stmt.where(ChannelsTable.name == name)
+
+    compiled = select_stmt.compile(dialect=DIALECT)
+    channel = await app.state.services.database.fetch_one(
+        str(compiled),
+        compiled.params,
+    )
+
+    return cast(Channel, dict(channel._mapping)) if channel is not None else None
 
 
 async def fetch_count(
-    read_priv: Optional[int] = None,
-    write_priv: Optional[int] = None,
-    auto_join: Optional[bool] = None,
+    read_priv: int | None = None,
+    write_priv: int | None = None,
+    auto_join: bool | None = None,
 ) -> int:
     if read_priv is None and write_priv is None and auto_join is None:
         raise ValueError("Must provide at least one parameter.")
 
-    query = """\
-        SELECT COUNT(*) AS count
-          FROM channels
-         WHERE read_priv = COALESCE(:read_priv, read_priv)
-           AND write_priv = COALESCE(:write_priv, write_priv)
-           AND auto_join = COALESCE(:auto_join, auto_join)
-    """
-    params = {
-        "read_priv": read_priv,
-        "write_priv": write_priv,
-        "auto_join": auto_join,
-    }
+    select_stmt = select(func.count().label("count")).select_from(ChannelsTable)
 
-    rec = await app.state.services.database.fetch_one(query, params)
+    if read_priv is not None:
+        select_stmt = select_stmt.where(ChannelsTable.read_priv == read_priv)
+    if write_priv is not None:
+        select_stmt = select_stmt.where(ChannelsTable.write_priv == write_priv)
+    if auto_join is not None:
+        select_stmt = select_stmt.where(ChannelsTable.auto_join == auto_join)
+
+    compiled = select_stmt.compile(dialect=DIALECT)
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
     assert rec is not None
-    return rec["count"]
+    return cast(int, rec._mapping["count"])
 
 
 async def fetch_many(
-    read_priv: Optional[int] = None,
-    write_priv: Optional[int] = None,
-    auto_join: Optional[bool] = None,
-    page: Optional[int] = None,
-    page_size: Optional[int] = None,
-) -> list[dict[str, Any]]:
+    read_priv: int | None = None,
+    write_priv: int | None = None,
+    auto_join: bool | None = None,
+    page: int | None = None,
+    page_size: int | None = None,
+) -> list[Channel]:
     """Fetch multiple channels from the database."""
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM channels
-         WHERE read_priv = COALESCE(:read_priv, read_priv)
-           AND write_priv = COALESCE(:write_priv, write_priv)
-           AND auto_join = COALESCE(:auto_join, auto_join)
-    """
-    params = {
-        "read_priv": read_priv,
-        "write_priv": write_priv,
-        "auto_join": auto_join,
-    }
+    select_stmt = select(READ_PARAMS)
+
+    if read_priv is not None:
+        select_stmt = select_stmt.where(ChannelsTable.read_priv == read_priv)
+    if write_priv is not None:
+        select_stmt = select_stmt.where(ChannelsTable.write_priv == write_priv)
+    if auto_join is not None:
+        select_stmt = select_stmt.where(ChannelsTable.auto_join == auto_join)
 
     if page is not None and page_size is not None:
-        query += """\
-            LIMIT :limit
-           OFFSET :offset
-        """
-        params["limit"] = page_size
-        params["offset"] = (page - 1) * page_size
+        select_stmt = select_stmt.limit(page_size).offset((page - 1) * page_size)
 
-    recs = await app.state.services.database.fetch_all(query, params)
-    return [dict(rec) for rec in recs]
+    compiled = select_stmt.compile(dialect=DIALECT)
+    channels = await app.state.services.database.fetch_all(
+        str(compiled),
+        compiled.params,
+    )
+    return cast(list[Channel], [dict(c._mapping) for c in channels])
 
 
-async def update(
+async def partial_update(
     name: str,
-    topic: Optional[str] = None,
-    read_priv: Optional[int] = None,
-    write_priv: Optional[int] = None,
-    auto_join: Optional[bool] = None,
-) -> Optional[dict[str, Any]]:
+    topic: str | _UnsetSentinel = UNSET,
+    read_priv: int | _UnsetSentinel = UNSET,
+    write_priv: int | _UnsetSentinel = UNSET,
+    auto_join: bool | _UnsetSentinel = UNSET,
+) -> Channel | None:
     """Update a channel in the database."""
-    query = """\
-        UPDATE channels
-           SET topic = COALESCE(:topic, topic),
-               read_priv = COALESCE(:read_priv, read_priv),
-               write_priv = COALESCE(:write_priv, write_priv),
-               auto_join = COALESCE(:auto_join, auto_join)
-         WHERE name = :name
-    """
-    params = {
-        "name": name,
-        "topic": topic,
-        "read_priv": read_priv,
-        "write_priv": write_priv,
-        "auto_join": auto_join,
-    }
-    await app.state.services.database.execute(query, params)
+    update_stmt = update(ChannelsTable).where(ChannelsTable.name == name)
 
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM channels
-         WHERE name = :name
-    """
-    params = {
-        "name": name,
-    }
-    rec = await app.state.services.database.fetch_one(query, params)
-    return dict(rec) if rec is not None else None
+    if not isinstance(topic, _UnsetSentinel):
+        update_stmt = update_stmt.values(topic=topic)
+    if not isinstance(read_priv, _UnsetSentinel):
+        update_stmt = update_stmt.values(read_priv=read_priv)
+    if not isinstance(write_priv, _UnsetSentinel):
+        update_stmt = update_stmt.values(write_priv=write_priv)
+    if not isinstance(auto_join, _UnsetSentinel):
+        update_stmt = update_stmt.values(auto_join=auto_join)
+
+    compiled = update_stmt.compile(dialect=DIALECT)
+    await app.state.services.database.execute(str(compiled), compiled.params)
+
+    select_stmt = select(READ_PARAMS).where(ChannelsTable.name == name)
+    compiled = select_stmt.compile(dialect=DIALECT)
+    channel = await app.state.services.database.fetch_one(
+        str(compiled),
+        compiled.params,
+    )
+    return cast(Channel, dict(channel._mapping)) if channel is not None else None
 
 
-async def delete(
+async def delete_one(
     name: str,
-) -> Optional[dict[str, Any]]:
+) -> Channel | None:
     """Delete a channel from the database."""
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM channels
-         WHERE name = :name
-    """
-    params = {
-        "name": name,
-    }
-    rec = await app.state.services.database.fetch_one(query, params)
+    select_stmt = select(READ_PARAMS).where(ChannelsTable.name == name)
+    compiled = select_stmt.compile(dialect=DIALECT)
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
     if rec is None:
         return None
 
-    query = """\
-        DELETE FROM channels
-              WHERE name = :name
-    """
-    params = {
-        "name": name,
-    }
-    await app.state.services.database.execute(query, params)
-    return dict(rec)
+    delete_stmt = delete(ChannelsTable).where(ChannelsTable.name == name)
+    compiled = delete_stmt.compile(dialect=DIALECT)
+    await app.state.services.database.execute(str(compiled), compiled.params)
+    return cast(Channel, dict(rec._mapping)) if rec is not None else None

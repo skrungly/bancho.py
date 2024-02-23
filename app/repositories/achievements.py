@@ -1,26 +1,62 @@
 from __future__ import annotations
 
-import textwrap
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 from typing import Any
-from typing import Optional
+from typing import TypedDict
+from typing import cast
 
 import app.state.services
+from app._typing import UNSET
+from app._typing import _UnsetSentinel
+from app.repositories import DIALECT
+from app.repositories import Base
 
-# +-------+--------------+------+-----+---------+----------------+
-# | Field | Type         | Null | Key | Default | Extra          |
-# +-------+--------------+------+-----+---------+----------------+
-# | id    | int          | NO   | PRI | NULL    | auto_increment |
-# | file  | varchar(128) | NO   | UNI | NULL    |                |
-# | name  | varchar(128) | NO   | UNI | NULL    |                |
-# | desc  | varchar(256) | NO   | UNI | NULL    |                |
-# | cond  | varchar(64)  | NO   |     | NULL    |                |
-# +-------+--------------+------+-----+---------+----------------+
+if TYPE_CHECKING:
+    from app.objects.score import Score
 
-READ_PARAMS = textwrap.dedent(
-    """\
-        id, file, name, `desc`, cond
-    """,
+from sqlalchemy import Column
+from sqlalchemy import Index
+from sqlalchemy import Integer
+from sqlalchemy import String
+from sqlalchemy import delete
+from sqlalchemy import func
+from sqlalchemy import insert
+from sqlalchemy import select
+from sqlalchemy import update
+
+
+class AchievementsTable(Base):
+    __tablename__ = "achievements"
+
+    id = Column("id", Integer, primary_key=True)
+    file = Column("file", String(128), nullable=False)
+    name = Column("name", String(128, collation="utf8"), nullable=False)
+    desc = Column("desc", String(256, collation="utf8"), nullable=False)
+    cond = Column("cond", String(64), nullable=False)
+
+    __table_args__ = (
+        Index("achievements_desc_uindex", desc, unique=True),
+        Index("achievements_file_uindex", file, unique=True),
+        Index("achievements_name_uindex", name, unique=True),
+    )
+
+
+READ_PARAMS = (
+    AchievementsTable.id,
+    AchievementsTable.file,
+    AchievementsTable.name,
+    AchievementsTable.desc,
+    AchievementsTable.cond,
 )
+
+
+class Achievement(TypedDict):
+    id: int
+    file: str
+    name: str
+    desc: str
+    cond: Callable[[Score, int], bool]
 
 
 async def create(
@@ -28,152 +64,136 @@ async def create(
     name: str,
     desc: str,
     cond: str,
-) -> dict[str, Any]:
+) -> Achievement:
     """Create a new achievement."""
-    query = """\
-        INSERT INTO achievements (file, name, desc, cond)
-             VALUES (:file, :name, :desc, :cond)
-    """
-    params = {
-        "file": file,
-        "name": name,
-        "desc": desc,
-        "cond": cond,
-    }
-    rec_id = await app.state.services.database.execute(query, params)
+    insert_stmt = insert(AchievementsTable).values(
+        file=file,
+        name=name,
+        desc=desc,
+        cond=cond,
+    )
+    compiled = insert_stmt.compile(dialect=DIALECT)
 
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM achievements
-         WHERE id = :id
-    """
-    params = {
-        "id": rec_id,
-    }
+    rec_id = await app.state.services.database.execute(str(compiled), compiled.params)
 
-    rec = await app.state.services.database.fetch_one(query, params)
+    select_stmt = select(READ_PARAMS).where(AchievementsTable.id == rec_id)
+    compiled = select_stmt.compile(dialect=DIALECT)
+
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
     assert rec is not None
-    return dict(rec)
+
+    achievement = dict(rec._mapping)
+    achievement["cond"] = eval(f'lambda score, mode_vn: {rec["cond"]}')
+    return cast(Achievement, achievement)
 
 
 async def fetch_one(
-    id: Optional[int] = None,
-    name: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
+    id: int | None = None,
+    name: str | None = None,
+) -> Achievement | None:
     """Fetch a single achievement."""
     if id is None and name is None:
         raise ValueError("Must provide at least one parameter.")
 
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM achievements
-         WHERE id = COALESCE(:id, id)
-            OR name = COALESCE(:name, name)
-    """
-    params = {
-        "id": id,
-        "name": name,
-    }
+    select_stmt = select(READ_PARAMS)
 
-    rec = await app.state.services.database.fetch_one(query, params)
-    return dict(rec) if rec is not None else None
+    if id is not None:
+        select_stmt = select_stmt.where(AchievementsTable.id == id)
+    if name is not None:
+        select_stmt = select_stmt.where(AchievementsTable.name == name)
+
+    compiled = select_stmt.compile(dialect=DIALECT)
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
+
+    if rec is None:
+        return None
+
+    achievement = dict(rec._mapping)
+    achievement["cond"] = eval(f'lambda score, mode_vn: {rec["cond"]}')
+    return cast(Achievement, achievement)
 
 
 async def fetch_count() -> int:
     """Fetch the number of achievements."""
-    query = """\
-        SELECT COUNT(*) AS count
-          FROM achievements
-    """
-    params = {}
+    select_stmt = select(func.count().label("count")).select_from(AchievementsTable)
+    compiled = select_stmt.compile(dialect=DIALECT)
 
-    rec = await app.state.services.database.fetch_one(query, params)
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
     assert rec is not None
-    return rec["count"]
+    return cast(int, rec._mapping["count"])
 
 
 async def fetch_many(
-    page: Optional[int] = None,
-    page_size: Optional[int] = None,
-) -> list[dict[str, Any]]:
+    page: int | None = None,
+    page_size: int | None = None,
+) -> list[Achievement]:
     """Fetch a list of achievements."""
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM achievements
-    """
-    params = {}
-
+    select_stmt = select(READ_PARAMS)
     if page is not None and page_size is not None:
-        query += """\
-            LIMIT :limit
-           OFFSET :offset
-        """
-        params["page_size"] = page_size
-        params["offset"] = (page - 1) * page_size
+        select_stmt = select_stmt.limit(page_size).offset((page - 1) * page_size)
 
-    recs = await app.state.services.database.fetch_all(query, params)
-    return [dict(rec) for rec in recs]
+    compiled = select_stmt.compile(dialect=DIALECT)
+
+    records = await app.state.services.database.fetch_all(
+        str(compiled),
+        compiled.params,
+    )
+
+    achievements: list[dict[str, Any]] = []
+
+    for rec in records:
+        achievement = dict(rec._mapping)
+        achievement["cond"] = eval(f'lambda score, mode_vn: {rec["cond"]}')
+        achievements.append(achievement)
+
+    return cast(list[Achievement], achievements)
 
 
-async def update(
+async def partial_update(
     id: int,
-    file: Optional[str] = None,
-    name: Optional[str] = None,
-    desc: Optional[str] = None,
-    cond: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
+    file: str | _UnsetSentinel = UNSET,
+    name: str | _UnsetSentinel = UNSET,
+    desc: str | _UnsetSentinel = UNSET,
+    cond: str | _UnsetSentinel = UNSET,
+) -> Achievement | None:
     """Update an existing achievement."""
-    query = """\
-        UPDATE achievements
-           SET file = COALESCE(:file, file),
-               name = COALESCE(:name, name),
-               desc = COALESCE(:desc, desc),
-               cond = COALESCE(:cond, cond)
-         WHERE id = :id
-    """
-    params = {
-        "id": id,
-        "file": file,
-        "name": name,
-        "desc": desc,
-        "cond": cond,
-    }
-    await app.state.services.database.execute(query, params)
+    update_stmt = update(AchievementsTable).where(AchievementsTable.id == id)
+    if not isinstance(file, _UnsetSentinel):
+        update_stmt = update_stmt.values(file=file)
+    if not isinstance(name, _UnsetSentinel):
+        update_stmt = update_stmt.values(name=name)
+    if not isinstance(desc, _UnsetSentinel):
+        update_stmt = update_stmt.values(desc=desc)
+    if not isinstance(cond, _UnsetSentinel):
+        update_stmt = update_stmt.values(cond=cond)
 
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM achievements
-         WHERE id = :id
-    """
-    params = {
-        "id": id,
-    }
-    rec = await app.state.services.database.fetch_one(query, params)
-    return dict(rec) if rec is not None else None
+    compiled = update_stmt.compile(dialect=DIALECT)
+    await app.state.services.database.execute(str(compiled), compiled.params)
+
+    select_stmt = select(READ_PARAMS).where(AchievementsTable.id == id)
+    compiled = select_stmt.compile(dialect=DIALECT)
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
+    assert rec is not None
+
+    achievement = dict(rec._mapping)
+    achievement["cond"] = eval(f'lambda score, mode_vn: {rec["cond"]}')
+    return cast(Achievement, achievement)
 
 
-async def delete(
+async def delete_one(
     id: int,
-) -> Optional[dict[str, Any]]:
+) -> Achievement | None:
     """Delete an existing achievement."""
-    query = f"""\
-        SELECT {READ_PARAMS}
-          FROM achievements
-         WHERE id = :id
-    """
-    params = {
-        "id": id,
-    }
-    rec = await app.state.services.database.fetch_one(query, params)
+    select_stmt = select(READ_PARAMS).where(AchievementsTable.id == id)
+    compiled = select_stmt.compile(dialect=DIALECT)
+    rec = await app.state.services.database.fetch_one(str(compiled), compiled.params)
     if rec is None:
         return None
 
-    query = """\
-        DELETE FROM achievements
-              WHERE id = :id
-    """
-    params = {
-        "id": id,
-    }
-    await app.state.services.database.execute(query, params)
-    return dict(rec)
+    delete_stmt = delete(AchievementsTable).where(AchievementsTable.id == id)
+    compiled = delete_stmt.compile(dialect=DIALECT)
+    await app.state.services.database.execute(str(compiled), compiled.params)
+
+    achievement = dict(rec._mapping)
+    achievement["cond"] = eval(f'lambda score, mode_vn: {rec["cond"]}')
+    return cast(Achievement, achievement)

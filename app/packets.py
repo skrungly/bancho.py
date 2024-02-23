@@ -4,20 +4,19 @@ import random
 import struct
 from abc import ABC
 from abc import abstractmethod
+from collections.abc import Callable
+from collections.abc import Collection
+from collections.abc import Iterator
 from dataclasses import dataclass
 from dataclasses import field
 from enum import IntEnum
 from enum import unique
 from functools import cache
 from functools import lru_cache
-from typing import Any
-from typing import Callable
-from typing import Collection
-from typing import Iterator
-from typing import NamedTuple
-from typing import Optional
 from typing import TYPE_CHECKING
-from typing import Union
+from typing import Any
+from typing import NamedTuple
+from typing import cast
 
 # from app.objects.beatmap import BeatmapInfo
 
@@ -25,8 +24,22 @@ if TYPE_CHECKING:
     from app.objects.match import Match
     from app.objects.player import Player
 
-# tuple of some of struct's format specifiers
-# for clean access within packet pack/unpack.
+# packets are comprised of 3 parts:
+# - a unique identifier (the packet id), representing the type of request
+# - the length of the request data
+# - request data; specific to the packet id
+
+# the packet id is sent over the wire as an unsigned short (2 bytes, u16)
+# the packet data length is sent as an unsigned long (4 bytes, u32)
+# the packet data
+# - is of variable length
+# - may comprise of multiple objects
+# - is specific to the request type (packet id)
+# - types can vary, but are from a fixed set of possibilities (u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, string, and some higher level types comprising of these primitives)
+
+# osu! packets are sent in "little endian" ordering.
+# little endian: [2, 0, 0, 0] == 2
+# big endian: [0, 0, 0, 2] == 2
 
 
 @unique
@@ -151,7 +164,6 @@ class ServerPackets(IntEnum):
         return f"<{self.name} ({self.value})>"
 
 
-# TODO: clean this up
 @unique
 class osuTypes(IntEnum):
     # integral
@@ -218,8 +230,8 @@ class ScoreFrame:
     num_katu: int
     num_miss: int
     total_score: int
-    current_combo: int
     max_combo: int
+    current_combo: int
     perfect: bool
     current_hp: int
     tag_byte: int
@@ -227,8 +239,8 @@ class ScoreFrame:
     score_v2: bool
 
     # if score_v2:
-    combo_portion: Optional[float] = None
-    bonus_portion: Optional[float] = None
+    combo_portion: float | None = None
+    bonus_portion: float | None = None
 
 
 class ReplayFrame(NamedTuple):
@@ -280,12 +292,10 @@ class MultiplayerMatch:
 
 
 class BasePacket(ABC):
-    def __init__(self, reader: BanchoPacketReader) -> None:
-        ...
+    def __init__(self, reader: BanchoPacketReader) -> None: ...
 
     @abstractmethod
-    async def handle(self, player: Player) -> None:
-        ...
+    async def handle(self, player: Player) -> None: ...
 
 
 PacketMap = dict[ClientPackets, type[BasePacket]]
@@ -309,7 +319,7 @@ class BanchoPacketReader:
 
     Intended Usage:
     >>> with memoryview(await request.body()) as body_view:
-    ...     for packet in BanchoPacketReader(conn.body):
+    ...     for packet in BanchoPacketReader(body_view):
     ...         await packet.handle()
     """
 
@@ -406,23 +416,23 @@ class BanchoPacketReader:
     def read_f16(self) -> float:
         (val,) = struct.unpack_from("<e", self.body_view[:2])
         self.body_view = self.body_view[2:]
-        return val
+        return cast(float, val)
 
     def read_f32(self) -> float:
         (val,) = struct.unpack_from("<f", self.body_view[:4])
         self.body_view = self.body_view[4:]
-        return val
+        return cast(float, val)
 
     def read_f64(self) -> float:
         (val,) = struct.unpack_from("<d", self.body_view[:8])
         self.body_view = self.body_view[8:]
-        return val
+        return cast(float, val)
 
     # complex types
 
     # XXX: some osu! packets use i16 for
     # array length, while others use i32
-    def read_i32_list_i16l(self) -> tuple[int]:
+    def read_i32_list_i16l(self) -> tuple[int, ...]:
         length = int.from_bytes(self.body_view[:2], "little")
         self.body_view = self.body_view[2:]
 
@@ -430,7 +440,7 @@ class BanchoPacketReader:
         self.body_view = self.body_view[length * 4 :]
         return val
 
-    def read_i32_list_i32l(self) -> tuple[int]:
+    def read_i32_list_i32l(self) -> tuple[int, ...]:
         length = int.from_bytes(self.body_view[:4], "little")
         self.body_view = self.body_view[4:]
 
@@ -552,7 +562,7 @@ class BanchoPacketReader:
 # write functions
 
 
-def write_uleb128(num: int) -> Union[bytes, bytearray]:
+def write_uleb128(num: int) -> bytes | bytearray:
     """Write `num` into an unsigned LEB128."""
     if num == 0:
         return b"\x00"
@@ -647,6 +657,7 @@ def write_match(m: Match, send_pw: bool = True) -> bytearray:
 
     for s in m.slots:
         if s.status & 0b01111100 != 0:  # SlotStatus.has_player
+            assert s.player is not None
             ret += s.player.id.to_bytes(4, "little")
 
     ret += m.host.id.to_bytes(4, "little")
@@ -675,8 +686,8 @@ def write_scoreframe(s: ScoreFrame) -> bytes:
         s.num_katu,
         s.num_miss,
         s.total_score,
-        s.current_combo,
         s.max_combo,
+        s.current_combo,
         s.perfect,
         s.current_hp,
         s.tag_byte,
@@ -701,7 +712,7 @@ _noexpand_types: dict[osuTypes, Callable[..., bytes]] = {
     osuTypes.string: write_string,
     osuTypes.i32_list: write_i32_list,
     osuTypes.scoreframe: write_scoreframe,
-    # TODO: write replayframe & bundle
+    # not (yet?) implemented: write replayframe & bundle
 }
 
 _expand_types: dict[osuTypes, Callable[..., bytearray]] = {
@@ -733,22 +744,28 @@ def write(packid: int, *args: tuple[Any, osuTypes]) -> bytes:
 # packets
 #
 
-# TODO: fix consistency of parameter names
+
+class LoginFailureReason(IntEnum):
+    AUTHENTICATION_FAILED = -1
+    OLD_CLIENT = -2
+    BANNED = -3
+    # BANNED = -4
+    ERROR_OCCURRED = -5
+    NEEDS_SUPPORTER = -6
+    PASSWORD_RESET = -7
+    REQUIRES_VERIFICATION = -8
 
 
 # packet id: 5
 @cache
-def user_id(user_id: int) -> bytes:
-    # id responses:
-    # -1: authentication failed
-    # -2: old client
-    # -3: banned
-    # -4: banned
-    # -5: error occurred
-    # -6: needs supporter
-    # -7: password reset
-    # -8: requires verification
-    # ??: valid id
+def login_reply(user_id: int) -> bytes:
+    """\
+    Construct a login reply packet.
+
+    In successful cases, we'll send the user's ID.
+
+    In failure cases, we'll send a negative integer of type `LoginFailureReason`.
+    """
     return write(ServerPackets.USER_ID, (user_id, osuTypes.i32))
 
 
@@ -851,11 +868,10 @@ def _user_stats(
         (plays, osuTypes.i32),
         (total_score, osuTypes.i64),
         (global_rank, osuTypes.i32),
-        (pp, osuTypes.i16),  # why not u16 peppy :(
+        (pp, osuTypes.i16),
     )
 
 
-# TODO: this is implementation-specific, move it out
 def user_stats(player: Player) -> bytes:
     gm_stats = player.gm_stats
     if gm_stats.pp > 0x7FFF:
@@ -1151,7 +1167,6 @@ def _user_presence(
     )
 
 
-# TODO: this is implementation-specific, move it out
 def user_presence(player: Player) -> bytes:
     return write(
         ServerPackets.USER_PRESENCE,
@@ -1174,6 +1189,7 @@ def restart_server(ms: int) -> bytes:
 
 # packet id: 88
 def match_invite(player: Player, target_name: str) -> bytes:
+    assert player.match is not None
     msg = f"Come join my game: {player.match.embed}."
     return write(
         ServerPackets.MATCH_INVITE,

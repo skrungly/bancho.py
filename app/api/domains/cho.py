@@ -1,17 +1,17 @@
 """ cho: handle cho packets from the osu! client """
+
 from __future__ import annotations
 
 import asyncio
 import re
 import struct
 import time
+from collections.abc import Callable
+from collections.abc import Mapping
 from datetime import date
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 from typing import Literal
-from typing import Mapping
-from typing import Optional
 from typing import TypedDict
 
 import bcrypt
@@ -32,8 +32,8 @@ from app import commands
 from app._typing import IPAddress
 from app.constants import regexes
 from app.constants.gamemodes import GameMode
-from app.constants.mods import Mods
 from app.constants.mods import SPEED_CHANGING_MODS
+from app.constants.mods import Mods
 from app.constants.privileges import ClanPrivileges
 from app.constants.privileges import ClientPrivileges
 from app.constants.privileges import Privileges
@@ -41,17 +41,15 @@ from app.logging import Ansi
 from app.logging import log
 from app.logging import magnitude_fmt_time
 from app.objects.beatmap import Beatmap
-from app.objects.beatmap import ensure_local_osu_file
+from app.objects.beatmap import ensure_osu_file_is_available
 from app.objects.channel import Channel
+from app.objects.match import MAX_MATCH_NAME_LENGTH
 from app.objects.match import Match
 from app.objects.match import MatchTeams
 from app.objects.match import MatchTeamTypes
 from app.objects.match import MatchWinConditions
 from app.objects.match import Slot
 from app.objects.match import SlotStatus
-from app.objects.menu import Menu
-from app.objects.menu import MenuCommands
-from app.objects.menu import MenuFunction
 from app.objects.player import Action
 from app.objects.player import ClientDetails
 from app.objects.player import OsuStream
@@ -61,7 +59,11 @@ from app.objects.player import PresenceFilter
 from app.packets import BanchoPacketReader
 from app.packets import BasePacket
 from app.packets import ClientPackets
-from app.repositories import players as players_repo
+from app.packets import LoginFailureReason
+from app.repositories import client_hashes as client_hashes_repo
+from app.repositories import ingame_logins as logins_repo
+from app.repositories import mail as mail_repo
+from app.repositories import users as users_repo
 from app.state import services
 from app.usecases.performance import ScoreParams
 
@@ -79,15 +81,17 @@ NOW_PLAYING_RGX = re.compile(
     r"(?P<mods>(?: (?:-|\+|~|\|)\w+(?:~|\|)?)+)?\x01$",
 )
 
+FIRST_USER_ID = 3
+
 router = APIRouter(tags=["Bancho API"])
 
 
 @router.get("/")
-async def bancho_http_handler():
+async def bancho_http_handler() -> Response:
     """Handle a request from a web browser."""
     new_line = "\n"
     matches = [m for m in app.state.sessions.matches if m is not None]
-    players = [p for p in app.state.sessions.players if not p.bot_client]
+    players = [p for p in app.state.sessions.players if not p.is_bot_client]
 
     packets = app.state.packets["all"]
 
@@ -109,12 +113,17 @@ async def bancho_http_handler():
 
 
 @router.get("/online")
-async def bancho_list_user():
+async def bancho_view_online_users() -> Response:
     """see who's online"""
     new_line = "\n"
 
-    players = [player for player in app.state.sessions.players if not player.bot_client]
-    bots = [bots for bots in app.state.sessions.players if bots.bot_client]
+    players: list[Player] = []
+    bots: list[Player] = []
+    for p in app.state.sessions.players:
+        if p.is_bot_client:
+            bots.append(p)
+        else:
+            players.append(p)
 
     id_max_length = len(str(max(p.id for p in app.state.sessions.players)))
 
@@ -132,7 +141,7 @@ bots:
 
 
 @router.get("/matches")
-async def bancho_list_user():
+async def bancho_view_matches() -> Response:
     """ongoing matches"""
     new_line = "\n"
 
@@ -171,20 +180,18 @@ matches:
 @router.post("/")
 async def bancho_handler(
     request: Request,
-    osu_token: Optional[str] = Header(None),
+    osu_token: str | None = Header(None),
     user_agent: Literal["osu!"] = Header(...),
-):
+) -> Response:
     ip = app.state.services.ip_resolver.get_ip(request.headers)
 
     if osu_token is None:
         # the client is performing a login
-        async with app.state.services.database.connection() as db_conn:
-            login_data = await login(
-                request.headers,
-                await request.body(),
-                ip,
-                db_conn,
-            )
+        login_data = await handle_osu_login_request(
+            request.headers,
+            await request.body(),
+            ip,
+        )
 
         return Response(
             content=login_data["response_body"],
@@ -320,7 +327,7 @@ class SendMessage(BasePacket):
             else:
                 return
 
-            t_chan = app.state.sessions.channels[f"#spec_{spec_id}"]
+            t_chan = app.state.sessions.channels.get_by_name(f"#spec_{spec_id}")
         elif recipient == "#multiplayer":
             if not player.match:
                 # they're not in a match?
@@ -328,7 +335,7 @@ class SendMessage(BasePacket):
 
             t_chan = player.match.chat
         else:
-            t_chan = app.state.sessions.channels[recipient]
+            t_chan = app.state.sessions.channels.get_by_name(recipient)
 
         if not t_chan:
             log(f"{player} wrote to non-existent {recipient}.", Ansi.LYELLOW)
@@ -400,8 +407,14 @@ class SendMessage(BasePacket):
                         # use player mode if not specified
                         mode_vn = player.status.mode.as_vanilla
 
+                    # parse the mods from regex
+                    mods = None
+                    if r_match["mods"] is not None:
+                        mods = Mods.from_np(r_match["mods"][1:], mode_vn)
+
                     player.last_np = {
                         "bmap": bmap,
+                        "mods": mods,
                         "mode_vn": mode_vn,
                         "timeout": time.time() + 300,  # /np's last 5mins
                     }
@@ -559,11 +572,94 @@ def parse_login_data(data: bytes) -> LoginData:
     }
 
 
-async def login(
+def parse_osu_version_string(osu_version_string: str) -> OsuVersion | None:
+    match = regexes.OSU_VERSION.match(osu_version_string)
+    if match is None:
+        return None
+
+    osu_version = OsuVersion(
+        date=date(
+            year=int(match["date"][0:4]),
+            month=int(match["date"][4:6]),
+            day=int(match["date"][6:8]),
+        ),
+        revision=int(match["revision"]) if match["revision"] else None,
+        stream=OsuStream(match["stream"] or "stable"),
+    )
+    return osu_version
+
+
+async def get_allowed_client_versions(osu_stream: OsuStream) -> set[date] | None:
+    """
+    Return a list of acceptable client versions for the given stream.
+
+    This is used to determine whether a client is too old to connect to the server.
+
+    Returns None if the connection to the osu! api fails.
+    """
+    osu_stream_str = osu_stream.value
+    if osu_stream in (OsuStream.STABLE, OsuStream.BETA):
+        osu_stream_str += "40"  # i wonder why this exists
+
+    response = await services.http_client.get(
+        OSU_API_V2_CHANGELOG_URL,
+        params={"stream": osu_stream_str},
+    )
+    if not response.is_success:
+        return None
+
+    allowed_client_versions: set[date] = set()
+    for build in response.json()["builds"]:
+        version = date(
+            int(build["version"][0:4]),
+            int(build["version"][4:6]),
+            int(build["version"][6:8]),
+        )
+        allowed_client_versions.add(version)
+        if any(entry["major"] for entry in build["changelog_entries"]):
+            # this build is a major iteration to the client
+            # don't allow anything older than this
+            break
+
+    return allowed_client_versions
+
+
+def parse_adapters_string(adapters_string: str) -> tuple[list[str], bool]:
+    running_under_wine = adapters_string == "runningunderwine"
+    adapters = adapters_string[:-1].split(".")
+    return adapters, running_under_wine
+
+
+async def authenticate(
+    username: str,
+    untrusted_password: bytes,
+) -> users_repo.User | None:
+    user_info = await users_repo.fetch_one(
+        name=username,
+        fetch_all_fields=True,
+    )
+    if user_info is None:
+        return None
+
+    trusted_hashword = user_info["pw_bcrypt"].encode()
+
+    # in-memory bcrypt lookup cache for performance
+    if trusted_hashword in app.state.cache.bcrypt:  # ~0.01 ms
+        if untrusted_password != app.state.cache.bcrypt[trusted_hashword]:
+            return None
+    else:  # ~200ms
+        if not bcrypt.checkpw(untrusted_password, trusted_hashword):
+            return None
+
+        app.state.cache.bcrypt[trusted_hashword] = untrusted_password
+
+    return user_info
+
+
+async def handle_osu_login_request(
     headers: Mapping[str, str],
     body: bytes,
     ip: IPAddress,
-    db_conn: databases.core.Connection,
 ) -> LoginResponse:
     """\
     Login has no specific packet, but happens when the osu!
@@ -590,63 +686,39 @@ async def login(
 
     # perform some validation & further parsing on the data
 
-    match = regexes.OSU_VERSION.match(login_data["osu_version"])
-    if match is None:
+    osu_version = parse_osu_version_string(login_data["osu_version"])
+    if osu_version is None:
         return {
             "osu_token": "invalid-request",
-            "response_body": b"",
+            "response_body": (
+                app.packets.login_reply(LoginFailureReason.AUTHENTICATION_FAILED)
+                + app.packets.notification("Please restart your osu! and try again.")
+            ),
         }
 
-    osu_version = OsuVersion(
-        date=date(
-            year=int(match["date"][0:4]),
-            month=int(match["date"][4:6]),
-            day=int(match["date"][6:8]),
-        ),
-        revision=int(match["revision"]) if match["revision"] else None,
-        stream=OsuStream(match["stream"] or "stable"),
-    )
-
     if app.settings.DISALLOW_OLD_CLIENTS:
-        osu_client_stream = osu_version.stream.value
-        if osu_client_stream in ("stable", "beta"):
-            osu_client_stream += "40"  # TODO: why?
-
-        allowed_client_versions = set()
-
-        async with services.http_client.get(
-            OSU_API_V2_CHANGELOG_URL,
-            params={"stream": osu_client_stream},
-        ) as resp:
-            for build in (await resp.json())["builds"]:
-                version = date(
-                    int(build["version"][0:4]),
-                    int(build["version"][4:6]),
-                    int(build["version"][6:8]),
-                )
-                allowed_client_versions.add(version)
-
-                if any(entry["major"] for entry in build["changelog_entries"]):
-                    # this build is a major iteration to the client
-                    # don't allow anything older than this
-                    break
-
-        if osu_version.date not in allowed_client_versions:
+        allowed_client_versions = await get_allowed_client_versions(
+            osu_version.stream,
+        )
+        # in the case where the osu! api fails, we'll allow the client to connect
+        if (
+            allowed_client_versions is not None
+            and osu_version.date not in allowed_client_versions
+        ):
             return {
                 "osu_token": "client-too-old",
                 "response_body": (
-                    app.packets.version_update() + app.packets.user_id(-2)
+                    app.packets.version_update()
+                    + app.packets.login_reply(LoginFailureReason.OLD_CLIENT)
                 ),
             }
 
-    running_under_wine = login_data["adapters_str"] == "runningunderwine"
-    adapters = [a for a in login_data["adapters_str"][:-1].split(".")]
-
+    adapters, running_under_wine = parse_adapters_string(login_data["adapters_str"])
     if not (running_under_wine or any(adapters)):
         return {
             "osu_token": "empty-adapters",
             "response_body": (
-                app.packets.user_id(-1)
+                app.packets.login_reply(LoginFailureReason.AUTHENTICATION_FAILED)
                 + app.packets.notification("Please restart your osu! and try again.")
             ),
         }
@@ -655,140 +727,79 @@ async def login(
 
     login_time = time.time()
 
-    # TODO: improve tournament client support
+    # disallow multiple sessions from a single user
+    # with the exception of tourney spectator clients
     player = app.state.sessions.players.get(name=login_data["username"])
-    if player:
-        # player is already logged in - allow this only for tournament clients
+    if player and osu_version.stream != "tourney":
+        # check if the existing session is still active
+        if (login_time - player.last_recv_time) < 10:
+            return {
+                "osu_token": "user-already-logged-in",
+                "response_body": (
+                    app.packets.login_reply(LoginFailureReason.AUTHENTICATION_FAILED)
+                    + app.packets.notification("User already logged in.")
+                ),
+            }
+        else:
+            # session is not active; replace it
+            player.logout()
+            del player
 
-        if not (osu_version.stream == "tourney" or player.tourney_client):
-            # neither session is a tournament client, disallow
-
-            if (login_time - player.last_recv_time) > 10:
-                # let this session overrule the existing one
-                # (this is made to help prevent user ghosting)
-                player.logout()
-            else:
-                # current session is still active, disallow
-                return {
-                    "osu_token": "user-ghosted",
-                    "response_body": (
-                        app.packets.user_id(-1)
-                        + app.packets.notification("User already logged in.")
-                    ),
-                }
-
-    user_info = await players_repo.fetch_one(
-        name=login_data["username"],
-        fetch_all_fields=True,
-    )
-
+    user_info = await authenticate(login_data["username"], login_data["password_md5"])
     if user_info is None:
-        # no account by this name exists.
         return {
-            "osu_token": "unknown-username",
+            "osu_token": "incorrect-credentials",
             "response_body": (
-                app.packets.notification(f"{BASE_DOMAIN}: Unknown username")
-                + app.packets.user_id(-1)
+                app.packets.notification(f"{BASE_DOMAIN}: Incorrect credentials")
+                + app.packets.login_reply(LoginFailureReason.AUTHENTICATION_FAILED)
             ),
         }
 
-    user_info = dict(user_info)  # make a mutable copy
-
-    if osu_version.stream == "tourney" and not (
+    if osu_version.stream is OsuStream.TOURNEY and not (
         user_info["priv"] & Privileges.DONATOR
         and user_info["priv"] & Privileges.UNRESTRICTED
     ):
         # trying to use tourney client with insufficient privileges.
         return {
             "osu_token": "no",
-            "response_body": app.packets.user_id(-1),
+            "response_body": app.packets.login_reply(
+                LoginFailureReason.AUTHENTICATION_FAILED,
+            ),
         }
-
-    # get our bcrypt cache
-    bcrypt_cache = app.state.cache.bcrypt
-    pw_bcrypt = user_info["pw_bcrypt"].encode()
-    user_info["pw_bcrypt"] = pw_bcrypt
-
-    # check credentials against db. algorithms like these are intentionally
-    # designed to be slow; we'll cache the results to speed up subsequent logins.
-    if pw_bcrypt in bcrypt_cache:  # ~0.01 ms
-        if login_data["password_md5"] != bcrypt_cache[pw_bcrypt]:
-            return {
-                "osu_token": "incorrect-password",
-                "response_body": (
-                    app.packets.notification(f"{BASE_DOMAIN}: Incorrect password")
-                    + app.packets.user_id(-1)
-                ),
-            }
-    else:  # ~200ms
-        if not bcrypt.checkpw(login_data["password_md5"], pw_bcrypt):
-            return {
-                "osu_token": "incorrect-password",
-                "response_body": (
-                    app.packets.notification(f"{BASE_DOMAIN}: Incorrect password")
-                    + app.packets.user_id(-1)
-                ),
-            }
-
-        bcrypt_cache[pw_bcrypt] = login_data["password_md5"]
 
     """ login credentials verified """
 
-    await db_conn.execute(
-        "INSERT INTO ingame_logins "
-        "(userid, ip, osu_ver, osu_stream, datetime) "
-        "VALUES (:id, :ip, :osu_ver, :osu_stream, NOW())",
-        {
-            "id": user_info["id"],
-            "ip": str(ip),
-            "osu_ver": osu_version.date,
-            "osu_stream": osu_version.stream,
-        },
+    await logins_repo.create(
+        user_id=user_info["id"],
+        ip=str(ip),
+        osu_ver=osu_version.date,
+        osu_stream=osu_version.stream,
     )
 
-    await db_conn.execute(
-        "INSERT INTO client_hashes "
-        "(userid, osupath, adapters, uninstall_id,"
-        " disk_serial, latest_time, occurrences) "
-        "VALUES (:id, :osupath, :adapters, :uninstall, :disk_serial, NOW(), 1) "
-        "ON DUPLICATE KEY UPDATE "
-        "occurrences = occurrences + 1, "
-        "latest_time = NOW() ",
-        {
-            "id": user_info["id"],
-            "osupath": login_data["osu_path_md5"],
-            "adapters": login_data["adapters_md5"],
-            "uninstall": login_data["uninstall_md5"],
-            "disk_serial": login_data["disk_signature_md5"],
-        },
+    await client_hashes_repo.create(
+        userid=user_info["id"],
+        osupath=login_data["osu_path_md5"],
+        adapters=login_data["adapters_md5"],
+        uninstall_id=login_data["uninstall_md5"],
+        disk_serial=login_data["disk_signature_md5"],
     )
 
     # TODO: store adapters individually
 
-    if running_under_wine:
-        hw_checks = "h.uninstall_id = :uninstall"
-        hw_args = {"uninstall": login_data["uninstall_md5"]}
-    else:
-        hw_checks = "h.adapters = :adapters OR h.uninstall_id = :uninstall OR h.disk_serial = :disk_serial"
-        hw_args = {
-            "adapters": login_data["adapters_md5"],
-            "uninstall": login_data["uninstall_md5"],
-            "disk_serial": login_data["disk_signature_md5"],
-        }
-
-    hw_matches = await db_conn.fetch_all(
-        "SELECT u.name, u.priv, h.occurrences "
-        "FROM client_hashes h "
-        "INNER JOIN users u ON h.userid = u.id "
-        "WHERE h.userid != :user_id AND "
-        f"({hw_checks})",
-        {"user_id": user_info["id"], **hw_args},
+    hw_matches = await client_hashes_repo.fetch_any_hardware_matches_for_user(
+        userid=user_info["id"],
+        running_under_wine=running_under_wine,
+        adapters=login_data["adapters_md5"],
+        uninstall_id=login_data["uninstall_md5"],
+        disk_serial=login_data["disk_signature_md5"],
     )
 
     if hw_matches:
         # we have other accounts with matching hashes
         if user_info["priv"] & Privileges.VERIFIED:
-            # TODO: this is a normal, registered & verified player.
+            # this is a normal, registered & verified player.
+            # TODO: this user may be multi-accounting; there may be
+            # some desirable behavior to implement here in the future.
             ...
         else:
             # this player is not verified yet, this is their first
@@ -804,22 +815,22 @@ async def login(
                         app.packets.notification(
                             "Please contact staff directly to create an account.",
                         )
-                        + app.packets.user_id(-1)
+                        + app.packets.login_reply(
+                            LoginFailureReason.AUTHENTICATION_FAILED,
+                        )
                     ),
                 }
 
     """ All checks passed, player is safe to login """
 
     # get clan & clan priv if we're in a clan
+    clan_id: int | None = None
+    clan_priv: ClanPrivileges | None = None
     if user_info["clan_id"] != 0:
-        clan = app.state.sessions.clans.get(id=user_info.pop("clan_id"))
-        clan_priv = ClanPrivileges(user_info.pop("clan_priv"))
-    else:
-        del user_info["clan_id"]
-        del user_info["clan_priv"]
-        clan = clan_priv = None
+        clan_id = user_info["clan_id"]
+        clan_priv = ClanPrivileges(user_info["clan_priv"])
 
-    db_country = user_info.pop("country")
+    db_country = user_info["country"]
 
     geoloc = await app.state.services.fetch_geoloc(ip, headers)
 
@@ -830,23 +841,18 @@ async def login(
                 app.packets.notification(
                     f"{BASE_DOMAIN}: Login failed. Please contact an admin.",
                 )
-                + app.packets.user_id(-1)
+                + app.packets.login_reply(LoginFailureReason.AUTHENTICATION_FAILED)
             ),
         }
-
-    user_info["geoloc"] = geoloc
 
     if db_country == "xx":
         # bugfix for old bancho.py versions when
         # country wasn't stored on registration.
         log(f"Fixing {login_data['username']}'s country.", Ansi.LGREEN)
 
-        await db_conn.execute(
-            "UPDATE users SET country = :country WHERE id = :user_id",
-            {
-                "country": user_info["geoloc"]["country"]["acronym"],
-                "user_id": user_info["id"],
-            },
+        await users_repo.update(
+            id=user_info["id"],
+            country=geoloc["country"]["acronym"],
         )
 
     client_details = ClientDetails(
@@ -860,18 +866,26 @@ async def login(
     )
 
     player = Player(
-        **user_info,  # {id, name, priv, pw_bcrypt, silence_end, api_key, geoloc?}
+        id=user_info["id"],
+        name=user_info["name"],
+        priv=Privileges(user_info["priv"]),
+        pw_bcrypt=user_info["pw_bcrypt"].encode(),
+        token=Player.generate_token(),
+        clan_id=clan_id,
+        clan_priv=clan_priv,
+        geoloc=geoloc,
         utc_offset=login_data["utc_offset"],
         pm_private=login_data["pm_private"],
-        login_time=login_time,
-        clan=clan,
-        clan_priv=clan_priv,
-        tourney_client=osu_version.stream == "tourney",
+        silence_end=user_info["silence_end"],
+        donor_end=user_info["donor_end"],
         client_details=client_details,
+        login_time=login_time,
+        is_tourney_client=osu_version.stream == "tourney",
+        api_key=user_info["api_key"],
     )
 
     data = bytearray(app.packets.protocol_version(19))
-    data += app.packets.user_id(player.id)
+    data += app.packets.login_reply(player.id)
 
     # *real* client privileges are sent with this packet,
     # then the user's apparent privileges are sent in the
@@ -915,9 +929,8 @@ async def login(
 
     # fetch some of the player's
     # information from sql to be cached.
-    await player.achievements_from_sql(db_conn)
-    await player.stats_from_sql_full(db_conn)
-    await player.relationships_from_sql(db_conn)
+    await player.stats_from_sql_full()
+    await player.relationships_from_sql()
 
     # TODO: fetch player.recent_scores from sql
 
@@ -952,33 +965,32 @@ async def login(
 
         # the player may have been sent mail while offline,
         # enqueue any messages from their respective authors.
-        mail_rows = await db_conn.fetch_all(
-            "SELECT m.`msg`, m.`time`, m.`from_id`, "
-            "(SELECT name FROM users WHERE id = m.`from_id`) AS `from`, "
-            "(SELECT name FROM users WHERE id = m.`to_id`) AS `to` "
-            "FROM `mail` m WHERE m.`to_id` = :to AND m.`read` = 0",
-            {"to": player.id},
+        mail_rows = await mail_repo.fetch_all_mail_to_user(
+            user_id=player.id,
+            read=False,
         )
 
         if mail_rows:
-            sent_to = set()  # ids
+            sent_to: set[int] = set()
 
             for msg in mail_rows:
-                if msg["from"] not in sent_to:
+                # Add "Unread messages" header as the first message
+                # for any given sender, to make it clear that the
+                # messages are coming from the mail system.
+                if msg["from_id"] not in sent_to:
                     data += app.packets.send_message(
-                        sender=msg["from"],
+                        sender=msg["from_name"],
                         msg="Unread messages",
-                        recipient=msg["to"],
+                        recipient=msg["to_name"],
                         sender_id=msg["from_id"],
                     )
-                    sent_to.add(msg["from"])
+                    sent_to.add(msg["from_id"])
 
                 msg_time = datetime.fromtimestamp(msg["time"])
-
                 data += app.packets.send_message(
-                    sender=msg["from"],
+                    sender=msg["from_name"],
                     msg=f'[{msg_time:%a %b %d @ %H:%M%p}] {msg["msg"]}',
-                    recipient=msg["to"],
+                    recipient=msg["to_name"],
                     sender_id=msg["from_id"],
                 )
 
@@ -987,7 +999,7 @@ async def login(
             # account & send info about the server/its usage.
             await player.add_privs(Privileges.VERIFIED)
 
-            if player.id == 3:
+            if player.id == FIRST_USER_ID:
                 # this is the first player registering on
                 # the server, grant them full privileges.
                 await player.add_privs(
@@ -1026,8 +1038,6 @@ async def login(
             recipient=player.name,
             sender_id=app.state.sessions.bot.id,
         )
-
-    # TODO: some sort of admin panel for staff members?
 
     # add `p` to the global player list,
     # making them officially logged in.
@@ -1211,7 +1221,7 @@ class SendPrivateMessage(BasePacket):
 
         if target is not app.state.sessions.bot:
             # target is not bot, send the message normally if online
-            if target.online:
+            if target.is_online:
                 target.send(msg, sender=player)
             else:
                 # inform user they're offline, but
@@ -1224,11 +1234,10 @@ class SendPrivateMessage(BasePacket):
                 )
 
             # insert mail into db, marked as unread.
-            await app.state.services.database.execute(
-                "INSERT INTO `mail` "
-                "(`from_id`, `to_id`, `msg`, `time`) "
-                "VALUES (:from, :to, :msg, UNIX_TIMESTAMP())",
-                {"from": player.id, "to": target.id, "msg": msg},
+            await mail_repo.create(
+                from_id=player.id,
+                to_id=target.id,
+                msg=msg,
             )
         else:
             # messaging the bot, check for commands & /np.
@@ -1260,20 +1269,25 @@ class SendPrivateMessage(BasePacket):
                             # use player mode if not specified
                             mode_vn = player.status.mode.as_vanilla
 
+                        # parse the mods from regex
+                        mods = None
+                        if r_match["mods"] is not None:
+                            mods = Mods.from_np(r_match["mods"][1:], mode_vn)
+
                         player.last_np = {
                             "bmap": bmap,
                             "mode_vn": mode_vn,
+                            "mods": mods,
                             "timeout": time.time() + 300,  # /np's last 5mins
                         }
 
                         # calculate generic pp values from their /np
 
-                        osu_file_path = BEATMAPS_PATH / f"{bmap.id}.osu"
-                        if not await ensure_local_osu_file(
-                            osu_file_path,
+                        osu_file_available = await ensure_osu_file_is_available(
                             bmap.id,
-                            bmap.md5,
-                        ):
+                            expected_md5=bmap.md5,
+                        )
+                        if not osu_file_available:
                             resp_msg = (
                                 "Mapfile could not be found; "
                                 "this incident has been reported."
@@ -1282,12 +1296,11 @@ class SendPrivateMessage(BasePacket):
                             # calculate pp for common generic values
                             pp_calc_st = time.time_ns()
 
+                            mods = None
                             if r_match["mods"] is not None:
                                 # [1:] to remove leading whitespace
                                 mods_str = r_match["mods"][1:]
                                 mods = Mods.from_np(mods_str, mode_vn)
-                            else:
-                                mods = None
 
                             scores = [
                                 ScoreParams(
@@ -1299,7 +1312,7 @@ class SendPrivateMessage(BasePacket):
                             ]
 
                             results = app.usecases.performance.calculate_performances(
-                                osu_file_path=str(osu_file_path),
+                                osu_file_path=str(BEATMAPS_PATH / f"{bmap.id}.osu"),
                                 scores=scores,
                             )
 
@@ -1338,7 +1351,28 @@ class LobbyJoin(BasePacket):
 
         for match in app.state.sessions.matches:
             if match is not None:
-                player.enqueue(app.packets.new_match(match))
+                try:
+                    player.enqueue(app.packets.new_match(match))
+                except ValueError:
+                    log(
+                        f"Failed to send match {match.id} to player joining lobby; likely due to missing host",
+                        Ansi.LYELLOW,
+                    )
+                    stacktrace = app.utils.get_appropriate_stacktrace()
+                    await app.state.services.log_strange_occurrence(stacktrace)
+                    continue
+
+
+def validate_match_data(
+    untrusted_match_data: app.packets.MultiplayerMatch,
+    expected_host_id: int,
+) -> bool:
+    return all(
+        (
+            untrusted_match_data.host_id == expected_host_id,
+            len(untrusted_match_data.name) <= MAX_MATCH_NAME_LENGTH,
+        ),
+    )
 
 
 @register(ClientPackets.CREATE_MATCH)
@@ -1347,7 +1381,10 @@ class MatchCreate(BasePacket):
         self.match_data = reader.read_match()
 
     async def handle(self, player: Player) -> None:
-        # TODO: match validation..?
+        if not validate_match_data(self.match_data, expected_host_id=player.id):
+            log(f"{player} tried to create a match with invalid data.", Ansi.LYELLOW)
+            return
+
         if player.restricted:
             player.enqueue(
                 app.packets.match_join_fail()
@@ -1378,8 +1415,8 @@ class MatchCreate(BasePacket):
         # to the global channel list as
         # an instanced channel.
         chat_channel = Channel(
-            name=f"#multi_{self.match_data.id}",
-            topic=f"MID {self.match_data.id}'s multiplayer channel.",
+            name=f"#multi_{match_id}",
+            topic=f"MID {match_id}'s multiplayer channel.",
             auto_join=False,
             instance=True,
         )
@@ -1387,13 +1424,13 @@ class MatchCreate(BasePacket):
         match = Match(
             id=match_id,
             name=self.match_data.name,
-            password=self.match_data.passwd,
+            password=self.match_data.passwd.removesuffix("//private"),
+            has_public_history=not self.match_data.passwd.endswith("//private"),
             map_name=self.match_data.map_name,
             map_id=self.match_data.map_id,
             map_md5=self.match_data.map_md5,
-            # TODO: validate no security hole exists
             host_id=self.match_data.host_id,
-            mode=self.match_data.mode,
+            mode=GameMode(self.match_data.mode),
             mods=Mods(self.match_data.mods),
             win_condition=MatchWinConditions(self.match_data.win_condition),
             team_type=MatchTeamTypes(self.match_data.team_type),
@@ -1413,36 +1450,6 @@ class MatchCreate(BasePacket):
         log(f"{player} created a new multiplayer match.")
 
 
-async def execute_menu_option(player: Player, key: int) -> None:
-    if key not in player.current_menu.options:
-        return
-
-    # this is one of their menu options, execute it.
-    cmd, data = player.current_menu.options[key]
-
-    if app.settings.DEBUG:
-        print(f"\x1b[0;95m{cmd!r}\x1b[0m {data}")
-
-    if cmd == MenuCommands.Reset:
-        # go back to the main menu
-        player.current_menu = player.previous_menus[0]
-        player.previous_menus.clear()
-    elif cmd == MenuCommands.Back:
-        # return one menu back
-        player.current_menu = player.previous_menus.pop()
-        player.send_current_menu()
-    elif cmd == MenuCommands.Advance:
-        # advance to a new menu
-        assert isinstance(data, Menu)
-        player.previous_menus.append(player.current_menu)
-        player.current_menu = data
-        player.send_current_menu()
-    elif cmd == MenuCommands.Execute:
-        # execute a function on the current menu
-        assert isinstance(data, MenuFunction)
-        await data.callback(player)
-
-
 @register(ClientPackets.JOIN_MATCH)
 class MatchJoin(BasePacket):
     def __init__(self, reader: BanchoPacketReader) -> None:
@@ -1450,16 +1457,6 @@ class MatchJoin(BasePacket):
         self.match_passwd = reader.read_string()
 
     async def handle(self, player: Player) -> None:
-        is_menu_request = self.match_id >= 64  # max multi matches
-
-        if is_menu_request or self.match_id < 0:
-            if is_menu_request:
-                # NOTE: this function is unrelated to mp.
-                await execute_menu_option(player, self.match_id)
-
-            player.enqueue(app.packets.match_join_fail())
-            return
-
         match = app.state.sessions.matches[self.match_id]
         if not match:
             log(f"{player} tried to join a non-existant mp lobby?")
@@ -1579,6 +1576,13 @@ class MatchChangeSettings(BasePacket):
         self.match_data = reader.read_match()
 
     async def handle(self, player: Player) -> None:
+        if not validate_match_data(self.match_data, expected_host_id=player.id):
+            log(
+                f"{player} tried to change match settings with invalid data.",
+                Ansi.LYELLOW,
+            )
+            return
+
         if player.match is None:
             return
 
@@ -1625,7 +1629,9 @@ class MatchChangeSettings(BasePacket):
         elif player.match.map_id == -1:
             if player.match.prev_map_id != self.match_data.map_id:
                 # new map has been chosen, send to match chat.
-                map_url = f"https://osu.{app.settings.DOMAIN}/beatmapsets/#/{self.match_data.map_id}"
+                map_url = (
+                    f"https://osu.{app.settings.DOMAIN}/b/{self.match_data.map_id}"
+                )
                 map_embed = f"[{map_url} {self.match_data.map_name}]"
                 player.match.chat.send_bot(f"Selected: {map_embed}.")
 
@@ -1637,12 +1643,12 @@ class MatchChangeSettings(BasePacket):
                 player.match.map_id = bmap.id
                 player.match.map_md5 = bmap.md5
                 player.match.map_name = bmap.full_name
-                player.match.mode = player.match.host.status.mode.as_vanilla
+                player.match.mode = GameMode(player.match.host.status.mode.as_vanilla)
             else:
                 player.match.map_id = self.match_data.map_id
                 player.match.map_md5 = self.match_data.map_md5
                 player.match.map_name = self.match_data.map_name
-                player.match.mode = self.match_data.mode
+                player.match.mode = GameMode(self.match_data.mode)
 
         if player.match.team_type != self.match_data.team_type:
             # if theres currently a scrim going on, only allow
@@ -1709,7 +1715,7 @@ class MatchStart(BasePacket):
 @register(ClientPackets.MATCH_SCORE_UPDATE)
 class MatchScoreUpdate(BasePacket):
     def __init__(self, reader: BanchoPacketReader) -> None:
-        self.play_data = reader.read_raw()  # TODO: probably not necessary
+        self.play_data = reader.read_raw()
 
     async def handle(self, player: Player) -> None:
         # this runs very frequently in matches,
@@ -1760,6 +1766,7 @@ class MatchComplete(BasePacket):
         ]
 
         player.match.unready_players(expected=SlotStatus.complete)
+        player.match.reset_players_loaded_status()
 
         player.match.in_progress = False
         player.match.enqueue(
@@ -1908,7 +1915,7 @@ class ChannelJoin(BasePacket):
         if self.name in IGNORED_CHANNELS:
             return
 
-        channel = app.state.sessions.channels[self.name]
+        channel = app.state.sessions.channels.get_by_name(self.name)
 
         if not channel or not player.join_channel(channel):
             log(f"{player} failed to join {self.name}.", Ansi.LYELLOW)
@@ -2074,7 +2081,7 @@ class ChannelPart(BasePacket):
         if self.name in IGNORED_CHANNELS:
             return
 
-        channel = app.state.sessions.channels[self.name]
+        channel = app.state.sessions.channels.get_by_name(self.name)
 
         if not channel:
             log(f"{player} failed to leave {self.name}.", Ansi.LYELLOW)
@@ -2159,9 +2166,16 @@ class MatchInvite(BasePacket):
 @register(ClientPackets.MATCH_CHANGE_PASSWORD)
 class MatchChangePassword(BasePacket):
     def __init__(self, reader: BanchoPacketReader) -> None:
-        self.match = reader.read_match()
+        self.match_data = reader.read_match()
 
     async def handle(self, player: Player) -> None:
+        if not validate_match_data(self.match_data, expected_host_id=player.id):
+            log(
+                f"{player} tried to change match password with invalid data.",
+                Ansi.LYELLOW,
+            )
+            return
+
         if player.match is None:
             return
 
@@ -2169,7 +2183,7 @@ class MatchChangePassword(BasePacket):
             log(f"{player} attempted to change pw as non-host.", Ansi.LYELLOW)
             return
 
-        player.match.passwd = self.match.passwd
+        player.match.passwd = self.match_data.passwd
         player.match.enqueue_state()
 
 
@@ -2195,7 +2209,6 @@ class UserPresenceRequest(BasePacket):
 @register(ClientPackets.USER_PRESENCE_REQUEST_ALL)
 class UserPresenceRequestAll(BasePacket):
     def __init__(self, reader: BanchoPacketReader) -> None:
-        # TODO: should probably ratelimit with this (300k s)
         self.ingame_time = reader.read_i32()
 
     async def handle(self, player: Player) -> None:

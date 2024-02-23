@@ -1,18 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import date
-from enum import Enum
 from enum import IntEnum
+from enum import StrEnum
 from enum import unique
 from functools import cached_property
-from typing import Any
-from typing import Optional
 from typing import TYPE_CHECKING
 from typing import TypedDict
-from typing import Union
+from typing import cast
 
 import databases.core
 
@@ -33,24 +32,21 @@ from app.objects.match import MatchTeams
 from app.objects.match import MatchTeamTypes
 from app.objects.match import Slot
 from app.objects.match import SlotStatus
-from app.objects.menu import Menu
-from app.objects.menu import menu_keygen
-from app.objects.menu import MenuCommands
-from app.objects.menu import MenuFunction
 from app.objects.score import Grade
 from app.objects.score import Score
+from app.repositories import clans as clans_repo
+from app.repositories import logs as logs_repo
 from app.repositories import stats as stats_repo
+from app.repositories import users as users_repo
+from app.state.services import Geolocation
 from app.utils import escape_enum
 from app.utils import make_safe_name
 from app.utils import pymysql_encode
 
 if TYPE_CHECKING:
-    from app.objects.achievement import Achievement
-    from app.objects.beatmap import Beatmap
-    from app.objects.clan import Clan
     from app.constants.privileges import ClanPrivileges
-
-__all__ = ("ModeData", "Status", "Player")
+    from app.objects.beatmap import Beatmap
+    from app.objects.score import Score
 
 
 @unique
@@ -113,40 +109,14 @@ class Status:
     map_id: int = 0
 
 
-# temporary menu-related stuff
-async def bot_hello(player: Player) -> None:
-    player.send_bot(f"hello {player.name}!")
-
-
-async def notif_hello(player: Player) -> None:
-    player.enqueue(app.packets.notification(f"hello {player.name}!"))
-
-
-MENU2 = Menu(
-    "Second Menu",
-    {
-        menu_keygen(): (MenuCommands.Back, None),
-        menu_keygen(): (MenuCommands.Execute, MenuFunction("notif_hello", notif_hello)),
-    },
-)
-
-MAIN_MENU = Menu(
-    "Main Menu",
-    {
-        menu_keygen(): (MenuCommands.Execute, MenuFunction("bot_hello", bot_hello)),
-        menu_keygen(): (MenuCommands.Execute, MenuFunction("notif_hello", notif_hello)),
-        menu_keygen(): (MenuCommands.Advance, MENU2),
-    },
-)
-
-
 class LastNp(TypedDict):
     bmap: Beatmap
     mode_vn: int
+    mods: Mods | None
     timeout: float
 
 
-class OsuStream(str, Enum):
+class OsuStream(StrEnum):
     STABLE = "stable"
     BETA = "beta"
     CUTTINGEDGE = "cuttingedge"
@@ -162,7 +132,7 @@ class OsuVersion:
     def __init__(
         self,
         date: date,
-        revision: Optional[int],  # TODO: should this be optional?
+        revision: int | None,  # TODO: should this be optional?
         stream: OsuStream,
     ) -> None:
         self.date = date
@@ -224,13 +194,13 @@ class Player:
     pres_filter: `PresenceFilter`
         The scope of users the client can currently see.
 
-    bot_client: `bool`
+    is_bot_client: `bool`
         Whether this is a bot account.
 
-    tourney_client: `bool`
+    is_tourney_client: `bool`
         Whether this is a management/spectator tourney client.
 
-    _queue: `bytearray`
+    _packet_queue: `bytearray`
         Bytes enqueued to the player which will be transmitted
         at the tail end of their next connection to the server.
         XXX: cls.enqueue() will add data to this queue, and
@@ -241,27 +211,58 @@ class Player:
         self,
         id: int,
         name: str,
-        priv: Union[int, Privileges],
-        **extras: Any,
+        priv: Privileges,
+        pw_bcrypt: bytes | None,
+        token: str,
+        clan_id: int | None = None,
+        clan_priv: ClanPrivileges | None = None,
+        geoloc: Geolocation | None = None,
+        utc_offset: int = 0,
+        pm_private: bool = False,
+        silence_end: int = 0,
+        donor_end: int = 0,
+        client_details: ClientDetails | None = None,
+        login_time: float = 0.0,
+        is_bot_client: bool = False,
+        is_tourney_client: bool = False,
+        api_key: str | None = None,
     ) -> None:
+        if geoloc is None:
+            geoloc = {
+                "latitude": 0.0,
+                "longitude": 0.0,
+                "country": {"acronym": "xx", "numeric": 0},
+            }
+
         self.id = id
         self.name = name
-        self.safe_name = self.make_safe(self.name)
+        self.priv = priv
+        self.pw_bcrypt = pw_bcrypt
+        self.token = token
+        self.clan_id = clan_id
+        self.clan_priv = clan_priv
+        self.geoloc = geoloc
+        self.utc_offset = utc_offset
+        self.pm_private = pm_private
+        self.silence_end = silence_end
+        self.donor_end = donor_end
+        self.client_details = client_details
+        self.login_time = login_time
+        self.last_recv_time = login_time
+        self.is_bot_client = is_bot_client
+        self.is_tourney_client = is_tourney_client
+        self.api_key = api_key
 
-        if "pw_bcrypt" in extras:
-            self.pw_bcrypt: Optional[bytes] = extras["pw_bcrypt"]
-        else:
-            self.pw_bcrypt = None
+        # avoid enqueuing packets to bot accounts.
+        if self.is_bot_client:
 
-        # generate a token if not given
-        token = extras.get("token", None)
-        if token is not None:
-            self.token = token
-        else:
-            self.token = self.generate_token()
+            def _noop_enqueue(data: bytes) -> None:
+                pass
 
-        # ensure priv is of type Privileges
-        self.priv = priv if isinstance(priv, Privileges) else Privileges(priv)
+            self.enqueue = _noop_enqueue  # type: ignore[method-assign]
+
+        self.away_msg: str | None = None
+        self.in_lobby = False
 
         self.stats: dict[GameMode, ModeData] = {}
         self.status = Status()
@@ -272,72 +273,32 @@ class Player:
 
         self.channels: list[Channel] = []
         self.spectators: list[Player] = []
-        self.spectating: Optional[Player] = None
-        self.match: Optional[Match] = None
+        self.spectating: Player | None = None
+        self.match: Match | None = None
         self.stealth = False
 
-        self.clan: Optional[Clan] = extras.get("clan")
-        self.clan_priv: Optional[ClanPrivileges] = extras.get("clan_priv")
-
-        self.achievements: set[Achievement] = set()
-
-        self.geoloc: app.state.services.Geolocation = extras.get(
-            "geoloc",
-            {
-                "latitude": 0.0,
-                "longitude": 0.0,
-                "country": {"acronym": "xx", "numeric": 0},
-            },
-        )
-
-        self.utc_offset = extras.get("utc_offset", 0)
-        self.pm_private = extras.get("pm_private", False)
-        self.away_msg: Optional[str] = None
-        self.silence_end = extras.get("silence_end", 0)
-        self.donor_end = extras.get("donor_end", 0)
-        self.in_lobby = False
-
-        self.client_details: Optional[ClientDetails] = extras.get("client_details")
         self.pres_filter = PresenceFilter.Nil
 
-        login_time = extras.get("login_time", 0.0)
-        self.login_time = login_time
-        self.last_recv_time = login_time
-
-        # XXX: below is mostly implementation-specific & internal stuff
-
         # store most recent score for each gamemode.
-        self.recent_scores: dict[GameMode, Optional[Score]] = {
+        self.recent_scores: dict[GameMode, Score | None] = {
             mode: None for mode in GameMode
         }
 
         # store the last beatmap /np'ed by the user.
-        self.last_np: Optional[LastNp] = None
+        self.last_np: LastNp | None = None
 
-        # TODO: document
-        self.current_menu = MAIN_MENU
-        self.previous_menus: list[Menu] = []
-
-        # subject to possible change in the future,
-        # although if anything, bot accounts will
-        # probably just use the /api/ routes?
-        self.bot_client = extras.get("bot_client", False)
-        if self.bot_client:
-            self.enqueue = lambda data: None  # type: ignore
-
-        self.tourney_client = extras.get("tourney_client", False)
-
-        self.api_key = extras.get("api_key", None)
-
-        # packet queue
-        self._queue = bytearray()
+        self._packet_queue = bytearray()
 
     def __repr__(self) -> str:
         return f"<{self.name} ({self.id})>"
 
     @property
-    def online(self) -> bool:
-        return self.token != ""
+    def safe_name(self) -> str:
+        return make_safe_name(self.name)
+
+    @property
+    def is_online(self) -> bool:
+        return bool(self.token != "")
 
     @property
     def url(self) -> str:
@@ -353,14 +314,6 @@ class Player:
     def avatar_url(self) -> str:
         """The url to the player's avatar."""
         return f"https://a.{app.settings.DOMAIN}/{self.id}"
-
-    @property
-    def full_name(self) -> str:
-        """The user's "full" name; including their clan tag."""
-        if self.clan:
-            return f"[{self.clan.tag}] {self.name}"
-        else:
-            return self.name
 
     # TODO: chat embed with clan tag hyperlinked?
 
@@ -401,7 +354,7 @@ class Player:
         return self.stats[self.status.mode]
 
     @property
-    def recent_score(self) -> Optional[Score]:
+    def recent_score(self) -> Score | None:
         """The player's most recently submitted score."""
         score = None
         for s in self.recent_scores.values():
@@ -421,11 +374,6 @@ class Player:
     def generate_token() -> str:
         """Generate a random uuid as a token."""
         return str(uuid.uuid4())
-
-    @staticmethod
-    def make_safe(name: str) -> str:
-        """Return a name safe for usage in sql."""
-        return make_safe_name(name)
 
     def logout(self) -> None:
         """Log `self` out of the server."""
@@ -459,46 +407,46 @@ class Player:
 
     async def update_privs(self, new: Privileges) -> None:
         """Update `self`'s privileges to `new`."""
+
         self.priv = new
-
-        await app.state.services.database.execute(
-            "UPDATE users SET priv = :priv WHERE id = :user_id",
-            {"priv": self.priv, "user_id": self.id},
-        )
-
-        if "bancho_priv" in self.__dict__:
+        if "bancho_priv" in vars(self):
             del self.bancho_priv  # wipe cached_property
+
+        await users_repo.update(
+            id=self.id,
+            priv=self.priv,
+        )
 
     async def add_privs(self, bits: Privileges) -> None:
         """Update `self`'s privileges, adding `bits`."""
+
         self.priv |= bits
-
-        await app.state.services.database.execute(
-            "UPDATE users SET priv = :priv WHERE id = :user_id",
-            {"priv": self.priv, "user_id": self.id},
-        )
-
-        if "bancho_priv" in self.__dict__:
+        if "bancho_priv" in vars(self):
             del self.bancho_priv  # wipe cached_property
 
-        if self.online:
+        await users_repo.update(
+            id=self.id,
+            priv=self.priv,
+        )
+
+        if self.is_online:
             # if they're online, send a packet
             # to update their client-side privileges
             self.enqueue(app.packets.bancho_privileges(self.bancho_priv))
 
     async def remove_privs(self, bits: Privileges) -> None:
         """Update `self`'s privileges, removing `bits`."""
+
         self.priv &= ~bits
-
-        await app.state.services.database.execute(
-            "UPDATE users SET priv = :priv WHERE id = :user_id",
-            {"priv": self.priv, "user_id": self.id},
-        )
-
-        if "bancho_priv" in self.__dict__:
+        if "bancho_priv" in vars(self):
             del self.bancho_priv  # wipe cached_property
 
-        if self.online:
+        await users_repo.update(
+            id=self.id,
+            priv=self.priv,
+        )
+
+        if self.is_online:
             # if they're online, send a packet
             # to update their client-side privileges
             self.enqueue(app.packets.bancho_privileges(self.bancho_priv))
@@ -507,11 +455,11 @@ class Player:
         """Restrict `self` for `reason`, and log to sql."""
         await self.remove_privs(Privileges.UNRESTRICTED)
 
-        await app.state.services.database.execute(
-            "INSERT INTO logs "
-            "(`from`, `to`, `action`, `msg`, `time`) "
-            "VALUES (:from, :to, :action, :msg, NOW())",
-            {"from": admin.id, "to": self.id, "action": "restrict", "msg": reason},
+        await logs_repo.create(
+            _from=admin.id,
+            to=self.id,
+            action="restrict",
+            msg=reason,
         )
 
         for mode in (0, 1, 2, 3, 4, 5, 6, 8):
@@ -531,26 +479,25 @@ class Player:
         webhook_url = app.settings.DISCORD_AUDIT_LOG_WEBHOOK
         if webhook_url:
             webhook = Webhook(webhook_url, content=log_msg)
-            await webhook.post(app.state.services.http_client)
+            asyncio.create_task(webhook.post())
 
         # refresh their client state
-        if self.online:
+        if self.is_online:
             self.logout()
 
     async def unrestrict(self, admin: Player, reason: str) -> None:
         """Restrict `self` for `reason`, and log to sql."""
         await self.add_privs(Privileges.UNRESTRICTED)
 
-        await app.state.services.database.execute(
-            "INSERT INTO logs "
-            "(`from`, `to`, `action`, `msg`, `time`) "
-            "VALUES (:from, :to, :action, :msg, NOW())",
-            {"from": admin.id, "to": self.id, "action": "unrestrict", "msg": reason},
+        await logs_repo.create(
+            _from=admin.id,
+            to=self.id,
+            action="unrestrict",
+            msg=reason,
         )
 
-        if not self.online:
-            async with app.state.services.database.connection() as db_conn:
-                await self.stats_from_sql_full(db_conn)
+        if not self.is_online:
+            await self.stats_from_sql_full()
 
         for mode, stats in self.stats.items():
             await app.state.services.redis.zadd(
@@ -569,9 +516,9 @@ class Player:
         webhook_url = app.settings.DISCORD_AUDIT_LOG_WEBHOOK
         if webhook_url:
             webhook = Webhook(webhook_url, content=log_msg)
-            await webhook.post(app.state.services.http_client)
+            asyncio.create_task(webhook.post())
 
-        if self.online:
+        if self.is_online:
             # log the user out if they're offline, this
             # will simply relog them and refresh their app.state
             self.logout()
@@ -580,16 +527,16 @@ class Player:
         """Silence `self` for `duration` seconds, and log to sql."""
         self.silence_end = int(time.time() + duration)
 
-        await app.state.services.database.execute(
-            "UPDATE users SET silence_end = :silence_end WHERE id = :user_id",
-            {"silence_end": self.silence_end, "user_id": self.id},
+        await users_repo.update(
+            id=self.id,
+            silence_end=self.silence_end,
         )
 
-        await app.state.services.database.execute(
-            "INSERT INTO logs "
-            "(`from`, `to`, `action`, `msg`, `time`) "
-            "VALUES (:from, :to, :action, :msg, NOW())",
-            {"from": admin.id, "to": self.id, "action": "silence", "msg": reason},
+        await logs_repo.create(
+            _from=admin.id,
+            to=self.id,
+            action="silence",
+            msg=reason,
         )
 
         # inform the user's client.
@@ -608,16 +555,16 @@ class Player:
         """Unsilence `self`, and log to sql."""
         self.silence_end = int(time.time())
 
-        await app.state.services.database.execute(
-            "UPDATE users SET silence_end = :silence_end WHERE id = :user_id",
-            {"silence_end": self.silence_end, "user_id": self.id},
+        await users_repo.update(
+            id=self.id,
+            silence_end=self.silence_end,
         )
 
-        await app.state.services.database.execute(
-            "INSERT INTO logs "
-            "(`from`, `to`, `action`, `msg`, `time`) "
-            "VALUES (:from, :to, :action, :reason, NOW())",
-            {"from": admin.id, "to": self.id, "reason": reason, "action": "unsilence"},
+        await logs_repo.create(
+            _from=admin.id,
+            to=self.id,
+            action="unsilence",
+            msg=reason,
         )
 
         # inform the user's client
@@ -660,7 +607,7 @@ class Player:
             log(f"{self} failed to join {match.chat}.", Ansi.LYELLOW)
             return False
 
-        lobby = app.state.sessions.channels["#lobby"]
+        lobby = app.state.sessions.channels.get_by_name("#lobby")
         if lobby in self.channels:
             self.leave_channel(lobby)
 
@@ -715,7 +662,7 @@ class Player:
 
             app.state.sessions.matches.remove(self.match)
 
-            lobby = app.state.sessions.channels["#lobby"]
+            lobby = app.state.sessions.channels.get_by_name("#lobby")
             if lobby:
                 lobby.enqueue(app.packets.dispose_match(self.match.id))
 
@@ -736,24 +683,6 @@ class Player:
             self.match.enqueue_state()
 
         self.match = None
-
-    async def join_clan(self, clan: Clan) -> bool:
-        """Attempt to add `self` to `clan`."""
-        if self.id in clan.member_ids:
-            return False
-
-        if not "invited":  # TODO
-            return False
-
-        await clan.add_member(self)
-        return True
-
-    async def leave_clan(self) -> None:
-        """Attempt to remove `self` from `c`."""
-        if not self.clan:
-            return
-
-        await self.clan.remove_member(self)
 
     def join_channel(self, channel: Channel) -> bool:
         """Attempt to add `self` to `channel`."""
@@ -830,7 +759,7 @@ class Player:
         """Attempt to add `player` to `self`'s spectators."""
         chan_name = f"#spec_{self.id}"
 
-        spec_chan = app.state.sessions.channels[chan_name]
+        spec_chan = app.state.sessions.channels.get_by_name(chan_name)
         if not spec_chan:
             # spectator chan doesn't exist, create it.
             spec_chan = Channel(
@@ -871,7 +800,9 @@ class Player:
         self.spectators.remove(player)
         player.spectating = None
 
-        channel = app.state.sessions.channels[f"#spec_{self.id}"]
+        channel = app.state.sessions.channels.get_by_name(f"#spec_{self.id}")
+        assert channel is not None
+
         player.leave_channel(channel)
 
         if not self.spectators:
@@ -962,18 +893,9 @@ class Player:
 
         log(f"{self} unblocked {player}.")
 
-    async def unlock_achievement(self, achievement: Achievement) -> None:
-        """Unlock `achievement` for `self`, storing in both cache & sql."""
-        await app.state.services.database.execute(
-            "INSERT INTO user_achievements (userid, achid) VALUES (:user_id, :ach_id)",
-            {"user_id": self.id, "ach_id": achievement.id},
-        )
-
-        self.achievements.add(achievement)
-
-    async def relationships_from_sql(self, db_conn: databases.core.Connection) -> None:
+    async def relationships_from_sql(self) -> None:
         """Retrieve `self`'s relationships from sql."""
-        for row in await db_conn.fetch_all(
+        for row in await app.state.services.database.fetch_all(
             "SELECT user2, type FROM relationships WHERE user1 = :user1",
             {"user1": self.id},
         ):
@@ -985,18 +907,6 @@ class Player:
         # always have bot added to friends.
         self.friends.add(1)
 
-    async def achievements_from_sql(self, db_conn: databases.core.Connection) -> None:
-        """Retrieve `self`'s achievements from sql."""
-        for row in await db_conn.fetch_all(
-            "SELECT ua.achid id FROM user_achievements ua "
-            "INNER JOIN achievements a ON a.id = ua.achid "
-            "WHERE ua.userid = :user_id",
-            {"user_id": self.id},
-        ):
-            for ach in app.state.sessions.achievements:
-                if row["id"] == ach.id:
-                    self.achievements.add(ach)
-
     async def get_global_rank(self, mode: GameMode) -> int:
         if self.restricted:
             return 0
@@ -1005,7 +915,7 @@ class Player:
             f"bancho:leaderboard:{mode.value}",
             str(self.id),
         )
-        return rank + 1 if rank is not None else 0
+        return cast(int, rank) + 1 if rank is not None else 0
 
     async def get_country_rank(self, mode: GameMode) -> int:
         if self.restricted:
@@ -1017,7 +927,7 @@ class Player:
             str(self.id),
         )
 
-        return rank + 1 if rank is not None else 0
+        return cast(int, rank) + 1 if rank is not None else 0
 
     async def update_rank(self, mode: GameMode) -> int:
         country = self.geoloc["country"]["acronym"]
@@ -1038,7 +948,7 @@ class Player:
 
         return await self.get_global_rank(mode)
 
-    async def stats_from_sql_full(self, db_conn: databases.core.Connection) -> None:
+    async def stats_from_sql_full(self) -> None:
         """Retrieve `self`'s stats (all modes) from sql."""
         for row in await stats_repo.fetch_many(player_id=self.id):
             game_mode = GameMode(row["mode"])
@@ -1061,54 +971,28 @@ class Player:
                 },
             )
 
-    def send_menu_clear(self) -> None:
-        """Clear the user's osu! chat with the bot
-        to make room for a new menu to be sent."""
-        # NOTE: the only issue with this is that it will
-        # wipe any messages the client can see from the bot
-        # (including any other channels). perhaps menus can
-        # be sent from a separate presence to prevent this?
-        self.enqueue(app.packets.user_silenced(app.state.sessions.bot.id))
-
-    def send_current_menu(self) -> None:
-        """Forward a standardized form of the user's
-        current menu to them via the osu! chat."""
-        msg = [self.current_menu.name]
-
-        for key, (cmd, data) in self.current_menu.options.items():
-            val = data.name if data else "Back"
-            msg.append(f"[osump://{key}/ {val}]")
-
-        chat_height = 10
-        lines_used = len(msg)
-        if lines_used < chat_height:
-            msg += [chr(8192)] * (chat_height - lines_used)
-
-        self.send_menu_clear()
-        self.send_bot("\n".join(msg))
-
     def update_latest_activity_soon(self) -> None:
         """Update the player's latest activity in the database."""
-        task = app.state.services.database.execute(
-            "UPDATE users SET latest_activity = UNIX_TIMESTAMP() WHERE id = :user_id",
-            {"user_id": self.id},
+        task = users_repo.update(
+            id=self.id,
+            latest_activity=int(time.time()),
         )
         app.state.loop.create_task(task)
 
     def enqueue(self, data: bytes) -> None:
         """Add data to be sent to the client."""
-        self._queue += data
+        self._packet_queue += data
 
-    def dequeue(self) -> Optional[bytes]:
+    def dequeue(self) -> bytes | None:
         """Get data from the queue to send to the client."""
-        if self._queue:
-            data = bytes(self._queue)
-            self._queue.clear()
+        if self._packet_queue:
+            data = bytes(self._packet_queue)
+            self._packet_queue.clear()
             return data
 
         return None
 
-    def send(self, msg: str, sender: Player, chan: Optional[Channel] = None) -> None:
+    def send(self, msg: str, sender: Player, chan: Channel | None = None) -> None:
         """Enqueue `sender`'s `msg` to `self`. Sent in `chan`, or dm."""
         self.enqueue(
             app.packets.send_message(

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.9
+#!/usr/bin/env python3.11
 from __future__ import annotations
 
 import argparse
@@ -6,34 +6,36 @@ import asyncio
 import math
 import os
 import sys
+from collections.abc import Awaitable
+from collections.abc import Iterator
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 from typing import Any
-from typing import Awaitable
-from typing import Iterator
-from typing import Optional
-from typing import Sequence
+from typing import TypeVar
 
-import aiohttp
-import aioredis
 import databases
 from akatsuki_pp_py import Beatmap
 from akatsuki_pp_py import Calculator
+from redis import asyncio as aioredis
 
 sys.path.insert(0, os.path.abspath(os.pardir))
 os.chdir(os.path.abspath(os.pardir))
 
 try:
-    from app.constants.privileges import Privileges
-    from app.constants.mods import Mods
-    from app.constants.gamemodes import GameMode
-    from app.objects.beatmap import ensure_local_osu_file
     import app.settings
     import app.state.services
+    from app.constants.gamemodes import GameMode
+    from app.constants.mods import Mods
+    from app.constants.privileges import Privileges
+    from app.objects.beatmap import ensure_osu_file_is_available
 except ModuleNotFoundError:
     print("\x1b[;91mMust run from tools/ directory\x1b[m")
     raise
+
+T = TypeVar("T")
+
 
 DEBUG = False
 BEATMAPS_PATH = Path.cwd() / ".data/osu"
@@ -46,7 +48,7 @@ class Context:
     beatmaps: dict[int, Beatmap] = field(default_factory=dict)
 
 
-def divide_chunks(values: list, n: int) -> Iterator[list]:
+def divide_chunks(values: list[T], n: int) -> Iterator[list[T]]:
     for i in range(0, len(values), n):
         yield values[i : i + n]
 
@@ -75,7 +77,7 @@ async def recalculate_score(
     )
     attrs = calculator.performance(beatmap)
 
-    new_pp: float = attrs.pp  # type: ignore
+    new_pp: float = attrs.pp
     if math.isnan(new_pp) or math.isinf(new_pp):
         new_pp = 0.0
 
@@ -98,10 +100,18 @@ async def process_score_chunk(
 ) -> None:
     tasks: list[Awaitable[None]] = []
     for score in chunk:
-        beatmap_path = BEATMAPS_PATH / f"{score['map_id']}.osu"
-        await ensure_local_osu_file(beatmap_path, score["map_id"], score["map_md5"])
-
-        tasks.append(recalculate_score(score, beatmap_path, ctx))
+        osu_file_available = await ensure_osu_file_is_available(
+            score["map_id"],
+            expected_md5=score["map_md5"],
+        )
+        if osu_file_available:
+            tasks.append(
+                recalculate_score(
+                    score,
+                    BEATMAPS_PATH / f"{score['map_id']}.osu",
+                    ctx,
+                ),
+            )
 
     await asyncio.gather(*tasks)
 
@@ -207,20 +217,36 @@ async def recalculate_mode_scores(mode: GameMode, ctx: Context) -> None:
         await process_score_chunk(score_chunk, ctx)
 
 
-async def main(argv: Optional[Sequence[str]] = None) -> int:
+async def main(argv: Sequence[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    if len(argv) == 0:
-        argv = ["--help"]
 
-    parser = argparse.ArgumentParser(description="Recalculate performance for scores")
+    parser = argparse.ArgumentParser(
+        description="Recalculate performance for scores and/or stats",
+    )
 
-    parser.add_argument("-d", "--debug", action="store_true")
+    parser.add_argument(
+        "-d",
+        "--debug",
+        help="Enable debug logging",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-scores",
+        help="Disable recalculating scores",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-stats",
+        help="Disable recalculating user stats",
+        action="store_true",
+    )
 
     parser.add_argument(
         "-m",
         "--mode",
         nargs=argparse.ONE_OR_MORE,
-        required=True,
+        required=False,
+        default=["0", "1", "2", "3", "4", "5", "6", "8"],
         # would love to do things like "vn!std", but "!" will break interpretation
         choices=["0", "1", "2", "3", "4", "5", "6", "8"],
     )
@@ -228,8 +254,6 @@ async def main(argv: Optional[Sequence[str]] = None) -> int:
 
     global DEBUG
     DEBUG = args.debug
-
-    app.state.services.http_client = aiohttp.ClientSession()
 
     db = databases.Database(app.settings.DB_DSN)
     await db.connect()
@@ -241,12 +265,15 @@ async def main(argv: Optional[Sequence[str]] = None) -> int:
     for mode in args.mode:
         mode = GameMode(int(mode))
 
-        await recalculate_mode_scores(mode, ctx)
-        await recalculate_mode_users(mode, ctx)
+        if not args.no_scores:
+            await recalculate_mode_scores(mode, ctx)
 
-    await app.state.services.http_client.close()
+        if not args.no_stats:
+            await recalculate_mode_users(mode, ctx)
+
+    await app.state.services.http_client.aclose()
     await db.disconnect()
-    await redis.close()
+    await redis.aclose()
 
     return 0
 

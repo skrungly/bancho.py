@@ -10,8 +10,6 @@ from app.constants.privileges import Privileges
 from app.logging import Ansi
 from app.logging import log
 
-__all__ = ("initialize_housekeeping_tasks",)
-
 OSU_CLIENT_MIN_PING_INTERVAL = 300000 // 1000  # defined by osu!
 
 
@@ -61,7 +59,7 @@ async def _remove_expired_donation_privileges(interval: int) -> None:
                 {"id": player.id},
             )
 
-            if player.online:
+            if player.is_online:
                 player.enqueue(
                     app.packets.notification("Your supporter status has expired."),
                 )

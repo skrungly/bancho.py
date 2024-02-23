@@ -3,14 +3,18 @@ from __future__ import annotations
 import functools
 import hashlib
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime
 from datetime import timedelta
 from enum import IntEnum
 from enum import unique
 from pathlib import Path
 from typing import Any
-from typing import Mapping
-from typing import Optional
+from typing import TypedDict
+
+import httpx
+from tenacity import retry
+from tenacity.stop import stop_after_attempt
 
 import app.settings
 import app.state
@@ -24,8 +28,6 @@ from app.utils import pymysql_encode
 
 # from dataclasses import dataclass
 
-__all__ = ("ensure_local_osu_file", "RankedStatus", "Beatmap", "BeatmapSet")
-
 BEATMAPS_PATH = Path.cwd() / ".data/osu"
 
 DEFAULT_LAST_UPDATE = datetime(1970, 1, 1)
@@ -33,7 +35,13 @@ DEFAULT_LAST_UPDATE = datetime(1970, 1, 1)
 IGNORED_BEATMAP_CHARS = dict.fromkeys(map(ord, r':\/*<>?"|'), None)
 
 
-async def api_get_beatmaps(**params: Any) -> Optional[list[dict[str, Any]]]:
+class BeatmapApiResponse(TypedDict):
+    data: list[dict[str, Any]] | None
+    status_code: int
+
+
+@retry(reraise=True, stop=stop_after_attempt(3))
+async def api_get_beatmaps(**params: Any) -> BeatmapApiResponse:
     """\
     Fetch data from the osu!api with a beatmap's md5.
 
@@ -50,40 +58,64 @@ async def api_get_beatmaps(**params: Any) -> Optional[list[dict[str, Any]]]:
         # https://osu.direct/doc
         url = "https://osu.direct/api/get_beatmaps"
 
-    async with app.state.services.http_client.get(url, params=params) as response:
-        response_data = await response.json()
-        if response.status == 200 and response_data:  # (data may be [])
-            return response_data
+    response = await app.state.services.http_client.get(url, params=params)
+    response_data = response.json()
+    if response.status_code == 200 and response_data:  # (data may be [])
+        return {"data": response_data, "status_code": response.status_code}
 
-    return None
+    return {"data": None, "status_code": response.status_code}
 
 
-async def ensure_local_osu_file(
-    osu_file_path: Path,
-    bmap_id: int,
-    bmap_md5: str,
+@retry(reraise=True, stop=stop_after_attempt(3))
+async def api_get_osu_file(beatmap_id: int) -> bytes:
+    url = f"https://old.ppy.sh/osu/{beatmap_id}"
+    response = await app.state.services.http_client.get(url)
+    response.raise_for_status()
+    return response.read()
+
+
+def disk_has_expected_osu_file(
+    beatmap_id: int,
+    expected_md5: str | None = None,
 ) -> bool:
-    """Ensure we have the latest .osu file locally,
-    downloading it from the osu!api if required."""
-    if (
-        not osu_file_path.exists()
-        or hashlib.md5(osu_file_path.read_bytes()).hexdigest() != bmap_md5
-    ):
-        # need to get the file from the osu!api
-        if app.settings.DEBUG:
-            log(f"Doing osu!api (.osu file) request {bmap_id}", Ansi.LMAGENTA)
+    osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
+    file_exists = osu_file_path.exists()
+    if file_exists and expected_md5 is not None:
+        osu_file_md5 = hashlib.md5(osu_file_path.read_bytes()).hexdigest()
+        return osu_file_md5 == expected_md5
+    return file_exists
 
-        url = f"https://old.ppy.sh/osu/{bmap_id}"
-        async with app.state.services.http_client.get(url) as resp:
-            if resp.status != 200:
-                if 400 <= resp.status < 500:
-                    # client error, report this to cmyui
-                    stacktrace = app.utils.get_appropriate_stacktrace()
-                    await app.state.services.log_strange_occurrence(stacktrace)
-                return False
 
-            osu_file_path.write_bytes(await resp.read())
+def write_osu_file_to_disk(beatmap_id: int, data: bytes) -> None:
+    osu_file_path = BEATMAPS_PATH / f"{beatmap_id}.osu"
+    osu_file_path.write_bytes(data)
 
+
+async def ensure_osu_file_is_available(
+    beatmap_id: int,
+    expected_md5: str | None = None,
+) -> bool:
+    """\
+    Download the .osu file for a beatmap if it's not already present.
+
+    If `expected_md5` is provided, the file will be downloaded if it
+    does not match the expected md5 hash -- this is typically used for
+    ensuring a file is the latest expected version.
+
+    Returns whether the file is available for use.
+    """
+    if disk_has_expected_osu_file(beatmap_id, expected_md5):
+        return True
+
+    try:
+        latest_osu_file = await api_get_osu_file(beatmap_id)
+    except httpx.HTTPStatusError:
+        return False
+    except Exception:
+        log(f"Failed to fetch osu file for {beatmap_id}", Ansi.LRED)
+        return False
+
+    write_osu_file_to_disk(beatmap_id, latest_osu_file)
     return True
 
 
@@ -214,12 +246,12 @@ class Beatmap:
     maintaining a low overhead.
 
     The only methods you should need are:
-      await Beatmap.from_md5(md5: str, set_id: int = -1) -> Optional[Beatmap]
-      await Beatmap.from_bid(bid: int) -> Optional[Beatmap]
+      await Beatmap.from_md5(md5: str, set_id: int = -1) -> Beatmap | None
+      await Beatmap.from_bid(bid: int) -> Beatmap | None
 
     Properties:
       Beatmap.full -> str # Artist - Title [Version]
-      Beatmap.url -> str # https://osu.cmyui.xyz/beatmapsets/123/321
+      Beatmap.url -> str # https://osu.cmyui.xyz/b/321
       Beatmap.embed -> str # [{url} {full}]
 
       Beatmap.has_leaderboard -> bool
@@ -227,11 +259,11 @@ class Beatmap:
       Beatmap.as_dict -> dict[str, object]
 
     Lower level API:
-      Beatmap._from_md5_cache(md5: str, check_updates: bool = True) -> Optional[Beatmap]
-      Beatmap._from_bid_cache(bid: int, check_updates: bool = True) -> Optional[Beatmap]
+      Beatmap._from_md5_cache(md5: str, check_updates: bool = True) -> Beatmap | None
+      Beatmap._from_bid_cache(bid: int, check_updates: bool = True) -> Beatmap | None
 
-      Beatmap._from_md5_sql(md5: str) -> Optional[Beatmap]
-      Beatmap._from_bid_sql(bid: int) -> Optional[Beatmap]
+      Beatmap._from_md5_sql(md5: str) -> Beatmap | None
+      Beatmap._from_bid_sql(bid: int) -> Beatmap | None
 
       Beatmap._parse_from_osuapi_resp(osuapi_resp: dict[str, object]) -> None
 
@@ -245,38 +277,56 @@ class Beatmap:
         # XXX: This is set when a map's status is manually changed.
     """
 
-    def __init__(self, map_set: BeatmapSet, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        map_set: BeatmapSet,
+        md5: str = "",
+        id: int = 0,
+        set_id: int = 0,
+        artist: str = "",
+        title: str = "",
+        version: str = "",
+        creator: str = "",
+        last_update: datetime = DEFAULT_LAST_UPDATE,
+        total_length: int = 0,
+        max_combo: int = 0,
+        status: RankedStatus = RankedStatus.Pending,
+        frozen: bool = False,
+        plays: int = 0,
+        passes: int = 0,
+        mode: GameMode = GameMode.VANILLA_OSU,
+        bpm: float = 0.0,
+        cs: float = 0.0,
+        od: float = 0.0,
+        ar: float = 0.0,
+        hp: float = 0.0,
+        diff: float = 0.0,
+        filename: str = "",
+    ) -> None:
         self.set = map_set
 
-        self.md5 = kwargs.get("md5", "")
-        self.id = kwargs.get("id", 0)
-        self.set_id = kwargs.get("set_id", 0)
-
-        self.artist = kwargs.get("artist", "")
-        self.title = kwargs.get("title", "")
-        self.version = kwargs.get("version", "")  # diff name
-        self.creator = kwargs.get("creator", "")
-
-        self.last_update = kwargs.get("last_update", DEFAULT_LAST_UPDATE)
-        self.total_length = kwargs.get("total_length", 0)
-        self.max_combo = kwargs.get("max_combo", 0)
-
-        self.status = RankedStatus(kwargs.get("status", 0))
-        self.frozen = kwargs.get("frozen", False) == 1
-
-        self.plays = kwargs.get("plays", 0)
-        self.passes = kwargs.get("passes", 0)
-        self.mode = GameMode(kwargs.get("mode", 0))
-        self.bpm = kwargs.get("bpm", 0.0)
-
-        self.cs = kwargs.get("cs", 0.0)
-        self.od = kwargs.get("od", 0.0)
-        self.ar = kwargs.get("ar", 0.0)
-        self.hp = kwargs.get("hp", 0.0)
-
-        self.diff = kwargs.get("diff", 0.0)
-
-        self.filename = kwargs.get("filename", "")
+        self.md5 = md5
+        self.id = id
+        self.set_id = set_id
+        self.artist = artist
+        self.title = title
+        self.version = version
+        self.creator = creator
+        self.last_update = last_update
+        self.total_length = total_length
+        self.max_combo = max_combo
+        self.status = status
+        self.frozen = frozen
+        self.plays = plays
+        self.passes = passes
+        self.mode = mode
+        self.bpm = bpm
+        self.cs = cs
+        self.od = od
+        self.ar = ar
+        self.hp = hp
+        self.diff = diff
+        self.filename = filename
 
     def __repr__(self) -> str:
         return self.full_name
@@ -289,14 +339,12 @@ class Beatmap:
     @property
     def url(self) -> str:
         """The osu! beatmap url for `self`."""
-        return f"https://osu.{app.settings.DOMAIN}/beatmapsets/{self.set.id}#{self.id}"
+        return f"https://osu.{app.settings.DOMAIN}/b/{self.id}"
 
     @property
     def embed(self) -> str:
         """An osu! chat embed to `self`'s osu! beatmap page."""
         return f"[{self.url} {self.full_name}]"
-
-    # TODO: cache these & standardize method for changing status
 
     @property
     def has_leaderboard(self) -> bool:
@@ -337,8 +385,6 @@ class Beatmap:
             "diff": self.diff,
         }
 
-    # TODO: implement some locking for the map fetch methods
-
     """ High level API """
     # There are three levels of storage used for beatmaps,
     # the cache (ram), the db (disk), and the osu!api (web).
@@ -349,7 +395,7 @@ class Beatmap:
     # populating the higher levels of the cache with new maps.
 
     @classmethod
-    async def from_md5(cls, md5: str, set_id: int = -1) -> Optional[Beatmap]:
+    async def from_md5(cls, md5: str, set_id: int = -1) -> Beatmap | None:
         """Fetch a map from the cache, database, or osuapi by md5."""
         bmap = await cls._from_md5_cache(md5)
 
@@ -370,10 +416,11 @@ class Beatmap:
                     # set not found in db, try api
                     api_data = await api_get_beatmaps(h=md5)
 
-                    if not api_data:
+                    if api_data["data"] is None:
                         return None
 
-                    set_id = int(api_data[0]["beatmapset_id"])
+                    api_response = api_data["data"]
+                    set_id = int(api_response[0]["beatmapset_id"])
 
             # fetch (and cache) beatmap set
             beatmap_set = await BeatmapSet.from_bsid(set_id)
@@ -393,7 +440,7 @@ class Beatmap:
         return bmap
 
     @classmethod
-    async def from_bid(cls, bid: int) -> Optional[Beatmap]:
+    async def from_bid(cls, bid: int) -> Beatmap | None:
         """Fetch a map from the cache, database, or osuapi by id."""
         bmap = await cls._from_bid_cache(bid)
 
@@ -412,10 +459,11 @@ class Beatmap:
                 # set not found in db, try getting via api
                 api_data = await api_get_beatmaps(b=bid)
 
-                if not api_data:
+                if api_data["data"] is None:
                     return None
 
-                set_id = int(api_data[0]["beatmapset_id"])
+                api_response = api_data["data"]
+                set_id = int(api_response[0]["beatmapset_id"])
 
             # fetch (and cache) beatmap set
             beatmap_set = await BeatmapSet.from_bsid(set_id)
@@ -500,26 +548,14 @@ class Beatmap:
         self.diff = float(osuapi_resp["difficultyrating"])
 
     @staticmethod
-    async def _from_md5_cache(md5: str) -> Optional[Beatmap]:
+    async def _from_md5_cache(md5: str) -> Beatmap | None:
         """Fetch a map from the cache by md5."""
         return app.state.cache.beatmap.get(md5, None)
 
     @staticmethod
-    async def _from_bid_cache(bid: int) -> Optional[Beatmap]:
+    async def _from_bid_cache(bid: int) -> Beatmap | None:
         """Fetch a map from the cache by id."""
         return app.state.cache.beatmap.get(bid, None)
-
-    async def fetch_rating(self) -> Optional[float]:
-        """Fetch the beatmap's rating from sql."""
-        row = await app.state.services.database.fetch_one(
-            "SELECT AVG(rating) rating FROM ratings WHERE map_md5 = :map_md5",
-            {"map_md5": self.md5},
-        )
-
-        if row is None:
-            return None
-
-        return row["rating"]
 
 
 class BeatmapSet:
@@ -533,18 +569,18 @@ class BeatmapSet:
     information, while maintaining a low overhead.
 
     The only methods you should need are:
-      await BeatmapSet.from_bsid(bsid: int) -> Optional[BeatmapSet]
+      await BeatmapSet.from_bsid(bsid: int) -> BeatmapSet | None
 
       BeatmapSet.all_officially_ranked_or_approved() -> bool
       BeatmapSet.all_officially_loved() -> bool
 
     Properties:
-      BeatmapSet.url -> str # https://osu.cmyui.xyz/beatmapsets/123
+      BeatmapSet.url -> str # https://osu.cmyui.xyz/s/123
 
     Lower level API:
-      await BeatmapSet._from_bsid_cache(bsid: int) -> Optional[BeatmapSet]
-      await BeatmapSet._from_bsid_sql(bsid: int) -> Optional[BeatmapSet]
-      await BeatmapSet._from_bsid_osuapi(bsid: int) -> Optional[BeatmapSet]
+      await BeatmapSet._from_bsid_cache(bsid: int) -> BeatmapSet | None
+      await BeatmapSet._from_bsid_sql(bsid: int) -> BeatmapSet | None
+      await BeatmapSet._from_bsid_osuapi(bsid: int) -> BeatmapSet | None
 
       BeatmapSet._cache_expired() -> bool
       await BeatmapSet._update_if_available() -> None
@@ -555,7 +591,7 @@ class BeatmapSet:
         self,
         id: int,
         last_osuapi_check: datetime,
-        maps: Optional[list[Beatmap]] = None,
+        maps: list[Beatmap] | None = None,
     ) -> None:
         self.id = id
 
@@ -571,39 +607,22 @@ class BeatmapSet:
         return ", ".join(map_names)
 
     @property
-    def url(self) -> str:  # same as above, just no beatmap id
+    def url(self) -> str:
         """The online url for this beatmap set."""
-        return f"https://osu.{app.settings.DOMAIN}/beatmapsets/{self.id}"
+        return f"https://osu.{app.settings.DOMAIN}/s/{self.id}"
 
-    def all_officially_ranked_or_approved_or_frozen(self) -> bool:
-        """Whether all the maps in the set are
-        ranked or approved on official servers."""
-        return all(
-            # ranked status has been edited on bancho.py
-            bmap.frozen or
-            # ranked status is ranked or approved on bancho
-            bmap.status in (RankedStatus.Ranked, RankedStatus.Approved)
-            for bmap in self.maps
+    def any_beatmaps_have_official_leaderboards(self) -> bool:
+        """Whether all the maps in the set have leaderboards on official servers."""
+        leaderboard_having_statuses = (
+            RankedStatus.Loved,
+            RankedStatus.Ranked,
+            RankedStatus.Approved,
         )
-
-    def all_officially_loved_or_frozen(self) -> bool:
-        """Whether all the maps in the set are
-        loved on official servers."""
-        return all(
-            # ranked status has been edited on bancho.py
-            bmap.frozen or
-            # ranked status is loved on bancho
-            bmap.status == RankedStatus.Loved
-            for bmap in self.maps
-        )
+        return any(bmap.status in leaderboard_having_statuses for bmap in self.maps)
 
     def _cache_expired(self) -> bool:
         """Whether the cached version of the set is
         expired and needs an update from the osu!api."""
-        # ranked & approved maps are update-locked.
-        if self.all_officially_ranked_or_approved_or_frozen():
-            return False
-
         current_datetime = datetime.now()
 
         # the delta between cache invalidations will increase depending
@@ -615,23 +634,39 @@ class BeatmapSet:
         # the formula for this is subject to adjustment in the future.
         check_delta = timedelta(hours=2 + ((5 / 365) * update_delta.days))
 
-        # we'll consider it much less likely for a loved map to be updated;
-        # it's possible but the mapper will remove their leaderboard doing so.
-        if self.all_officially_loved_or_frozen():
-            # TODO: it's still possible for this to happen and the delta can span
-            # over multiple days quite easily here, there should be a command to
-            # force a cache invalidation on the set. (normal privs if spam protected)
+        # it's much less likely that a beatmapset who has beatmaps with
+        # leaderboards on official servers will be updated.
+        if self.any_beatmaps_have_official_leaderboards():
             check_delta *= 4
+
+        # we'll cache for an absolute maximum of 1 day.
+        check_delta = min(check_delta, timedelta(days=1))
 
         return current_datetime > (self.last_osuapi_check + check_delta)
 
     async def _update_if_available(self) -> None:
         """Fetch the newest data from the api, check for differences
         and propogate any update into our cache & database."""
-        api_data = await api_get_beatmaps(s=self.id)
-        if api_data:
+
+        try:
+            api_data = await api_get_beatmaps(s=self.id)
+        except (httpx.TransportError, httpx.DecodingError):
+            # NOTE: TransportError is directly caused by the API being unavailable
+
+            # NOTE: DecodingError is caused by the API returning HTML and
+            #       normally happens when CF protection is enabled while
+            #       osu! recovers from a DDOS attack
+
+            # we do not want to delete the beatmap in this case, so we simply return
+            # but do not set the last check, as we would like to retry these ASAP
+
+            return
+
+        if api_data["data"] is not None:
+            api_response = api_data["data"]
+
             old_maps = {bmap.id: bmap for bmap in self.maps}
-            new_maps = {int(api_map["beatmap_id"]): api_map for api_map in api_data}
+            new_maps = {int(api_map["beatmap_id"]): api_map for api_map in api_response}
 
             self.last_osuapi_check = datetime.now()
 
@@ -639,8 +674,11 @@ class BeatmapSet:
             # update maps from old_maps where old.md5 != new.md5
             # add maps to old_maps where new.id not in old_maps
 
-            updated_maps: list[Beatmap] = []  # TODO: optimize
+            updated_maps: list[Beatmap] = []
             map_md5s_to_delete: set[str] = set()
+
+            # temp value for building the new beatmap
+            bmap: Beatmap
 
             # find maps in our current state that've been deleted, or need updates
             for old_id, old_map in old_maps.items():
@@ -662,13 +700,13 @@ class BeatmapSet:
                         updated_maps.append(bmap)
                     else:
                         # map is the same, make no changes
-                        updated_maps.append(old_map)  # TODO: is this needed?
+                        updated_maps.append(old_map)  # (this line is _maybe_ needed?)
 
             # find maps that aren't in our current state, and add them
             for new_id, new_map in new_maps.items():
                 if new_id not in old_maps:
                     # new map we don't have locally, add it
-                    bmap: Beatmap = Beatmap.__new__(Beatmap)
+                    bmap = Beatmap.__new__(Beatmap)
                     bmap.id = new_id
 
                     bmap._parse_from_osuapi_resp(new_map)
@@ -694,7 +732,6 @@ class BeatmapSet:
                 )
 
                 # delete scores on the maps
-                # TODO: if we add FKs to db, won't need this?
                 await app.state.services.database.execute(
                     "DELETE FROM scores WHERE map_md5 IN :map_md5s",
                     {"map_md5s": map_md5s_to_delete},
@@ -714,9 +751,13 @@ class BeatmapSet:
 
             # update maps in sql
             await self._save_to_sql()
-        else:
-            # TODO: we have the map on disk but it's
-            #       been removed from the osu!api.
+        elif api_data["status_code"] in (404, 200):
+            # NOTE: 200 can return an empty array of beatmaps,
+            #       so we still delete in this case if the beatmap data is None
+
+            # TODO: a couple of open questions here:
+            # - should we delete the beatmap from the database if it's not in the osu!api?
+            # - are 404 and 200 the only cases where we should delete the beatmap?
             map_md5s_to_delete = {bmap.md5 for bmap in self.maps}
 
             # delete maps
@@ -726,7 +767,6 @@ class BeatmapSet:
             )
 
             # delete scores on the maps
-            # TODO: if we add FKs to db, won't need this?
             await app.state.services.database.execute(
                 "DELETE FROM scores WHERE map_md5 IN :map_md5s",
                 {"map_md5s": map_md5s_to_delete},
@@ -787,77 +827,78 @@ class BeatmapSet:
         )
 
     @staticmethod
-    async def _from_bsid_cache(bsid: int) -> Optional[BeatmapSet]:
+    async def _from_bsid_cache(bsid: int) -> BeatmapSet | None:
         """Fetch a mapset from the cache by set id."""
         return app.state.cache.beatmapset.get(bsid, None)
 
     @classmethod
-    async def _from_bsid_sql(cls, bsid: int) -> Optional[BeatmapSet]:
+    async def _from_bsid_sql(cls, bsid: int) -> BeatmapSet | None:
         """Fetch a mapset from the database by set id."""
-        async with app.state.services.database.connection() as db_conn:
-            last_osuapi_check = await db_conn.fetch_val(
-                "SELECT last_osuapi_check FROM mapsets WHERE id = :set_id",
-                {"set_id": bsid},
-                column=0,  # last_osuapi_check
+        last_osuapi_check = await app.state.services.database.fetch_val(
+            "SELECT last_osuapi_check FROM mapsets WHERE id = :set_id",
+            {"set_id": bsid},
+            column=0,  # last_osuapi_check
+        )
+
+        if last_osuapi_check is None:
+            return None
+
+        bmap_set = cls(id=bsid, last_osuapi_check=last_osuapi_check)
+
+        for row in await maps_repo.fetch_many(set_id=bsid):
+            bmap = Beatmap(
+                md5=row["md5"],
+                id=row["id"],
+                set_id=row["set_id"],
+                artist=row["artist"],
+                title=row["title"],
+                version=row["version"],
+                creator=row["creator"],
+                last_update=row["last_update"],
+                total_length=row["total_length"],
+                max_combo=row["max_combo"],
+                status=RankedStatus(row["status"]),
+                frozen=row["frozen"],
+                plays=row["plays"],
+                passes=row["passes"],
+                mode=GameMode(row["mode"]),
+                bpm=row["bpm"],
+                cs=row["cs"],
+                od=row["od"],
+                ar=row["ar"],
+                hp=row["hp"],
+                diff=row["diff"],
+                filename=row["filename"],
+                map_set=bmap_set,
             )
 
-            if last_osuapi_check is None:
-                return None
-
-            bmap_set = cls(id=bsid, last_osuapi_check=last_osuapi_check)
-
-            for row in await maps_repo.fetch_many(set_id=bsid):
-                bmap = Beatmap(
-                    md5=row["md5"],
-                    id=row["id"],
-                    set_id=row["set_id"],
-                    artist=row["artist"],
-                    title=row["title"],
-                    version=row["version"],
-                    creator=row["creator"],
-                    last_update=row["last_update"],
-                    total_length=row["total_length"],
-                    max_combo=row["max_combo"],
-                    status=row["status"],
-                    frozen=row["frozen"],
-                    plays=row["plays"],
-                    passes=row["passes"],
-                    mode=row["mode"],
-                    bpm=row["bpm"],
-                    cs=row["cs"],
-                    od=row["od"],
-                    ar=row["ar"],
-                    hp=row["hp"],
-                    diff=row["diff"],
-                    filename=row["filename"],
-                    map_set=bmap_set,
+            # XXX: tempfix for bancho.py <v3.4.1,
+            # where filenames weren't stored.
+            if not bmap.filename:
+                bmap.filename = (
+                    ("{artist} - {title} ({creator}) [{version}].osu")
+                    .format(
+                        artist=row["artist"],
+                        title=row["title"],
+                        creator=row["creator"],
+                        version=row["version"],
+                    )
+                    .translate(IGNORED_BEATMAP_CHARS)
                 )
 
-                # XXX: tempfix for bancho.py <v3.4.1,
-                # where filenames weren't stored.
-                if not bmap.filename:
-                    bmap.filename = (
-                        ("{artist} - {title} ({creator}) [{version}].osu")
-                        .format(
-                            artist=row["artist"],
-                            title=row["title"],
-                            creator=row["creator"],
-                            version=row["version"],
-                        )
-                        .translate(IGNORED_BEATMAP_CHARS)
-                    )
+                await maps_repo.update(bmap.id, filename=bmap.filename)
 
-                    await maps_repo.update(bmap.id, filename=bmap.filename)
-
-                bmap_set.maps.append(bmap)
+            bmap_set.maps.append(bmap)
 
         return bmap_set
 
     @classmethod
-    async def _from_bsid_osuapi(cls, bsid: int) -> Optional[BeatmapSet]:
+    async def _from_bsid_osuapi(cls, bsid: int) -> BeatmapSet | None:
         """Fetch a mapset from the osu!api by set id."""
         api_data = await api_get_beatmaps(s=bsid)
-        if api_data:
+        if api_data["data"] is not None:
+            api_response = api_data["data"]
+
             self = cls(id=bsid, last_osuapi_check=datetime.now())
 
             # XXX: pre-mapset bancho.py support
@@ -870,7 +911,7 @@ class BeatmapSet:
 
             current_maps = {row["id"]: row["status"] for row in res}
 
-            for api_bmap in api_data:
+            for api_bmap in api_response:
                 # newer version available for this map
                 bmap: Beatmap = Beatmap.__new__(Beatmap)
                 bmap.id = int(api_bmap["beatmap_id"])
@@ -908,7 +949,7 @@ class BeatmapSet:
         return None
 
     @classmethod
-    async def from_bsid(cls, bsid: int) -> Optional[BeatmapSet]:
+    async def from_bsid(cls, bsid: int) -> BeatmapSet | None:
         """Cache all maps in a set from the osuapi, optionally
         returning beatmaps by their md5 or id."""
         bmap_set = await cls._from_bsid_cache(bsid)

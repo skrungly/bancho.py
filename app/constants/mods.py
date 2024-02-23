@@ -7,10 +7,6 @@ from enum import unique
 from app.utils import escape_enum
 from app.utils import pymysql_encode
 
-__all__ = ("Mods",)
-
-# NOTE: the order of some of these = stupid
-
 
 @unique
 @pymysql_encode(escape_enum)
@@ -109,7 +105,6 @@ class Mods(IntFlag):
                 self &= ~Mods.FADEIN  # HDFI
 
         # 4 remove multiple keymods
-        # TODO: do this better
         keymods_used = self & KEY_MODS
 
         if bin(keymods_used).count("1") > 1:
@@ -119,6 +114,8 @@ class Mods(IntFlag):
                 if keymods_used & mod:
                     first_keymod = mod
                     break
+
+            assert first_keymod is not None
 
             # remove all but the first keymod.
             self &= ~(keymods_used & ~first_keymod)
@@ -150,7 +147,6 @@ class Mods(IntFlag):
         mods = cls.NOMOD
         _dict = npstr2mod_dict  # global
 
-        # TODO: dis
         for mod in s.split(" "):
             if mod not in _dict:
                 continue

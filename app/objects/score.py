@@ -6,7 +6,6 @@ from datetime import datetime
 from enum import IntEnum
 from enum import unique
 from pathlib import Path
-from typing import Optional
 from typing import TYPE_CHECKING
 
 import app.state
@@ -23,8 +22,6 @@ from app.utils import pymysql_encode
 
 if TYPE_CHECKING:
     from app.objects.player import Player
-
-__all__ = ("Grade", "SubmissionStatus", "Score")
 
 BEATMAPS_PATH = Path.cwd() / ".data/osu"
 
@@ -89,10 +86,10 @@ class Score:
 
     Possibly confusing attributes
     -----------
-    bmap: Optional[`Beatmap`]
+    bmap: `Beatmap | None`
         A beatmap obj representing the osu map.
 
-    player: Optional[`Player`]
+    player: `Player | None`
         A player obj of the player who submitted the score.
 
     grade: `Grade`
@@ -110,7 +107,7 @@ class Score:
     client_flags: `int`
         osu!'s old anticheat flags.
 
-    prev_best: Optional[`Score`]
+    prev_best: `Score | None`
         The previous best score before this play was submitted.
         NOTE: just because a score has a `prev_best` attribute does
         mean the score is our best score on the map! the `status`
@@ -119,9 +116,9 @@ class Score:
 
     def __init__(self) -> None:
         # TODO: check whether the reamining Optional's should be
-        self.id: Optional[int] = None
-        self.bmap: Optional[Beatmap] = None
-        self.player: Optional[Player] = None
+        self.id: int | None = None
+        self.bmap: Beatmap | None = None
+        self.player: Player | None = None
 
         self.mode: GameMode
         self.mods: Mods
@@ -154,12 +151,13 @@ class Score:
         self.client_flags: ClientFlags
         self.client_checksum: str
 
-        self.rank: Optional[int] = None
-        self.prev_best: Optional[Score] = None
+        self.rank: int | None = None
+        self.prev_best: Score | None = None
 
     def __repr__(self) -> str:
         # TODO: i really need to clean up my reprs
         try:
+            assert self.bmap is not None
             return (
                 f"<{self.acc:.2f}% {self.max_combo}x {self.nmiss}M "
                 f"#{self.rank} on {self.bmap.full_name} for {self.pp:,.2f}pp>"
@@ -170,7 +168,7 @@ class Score:
     """Classmethods to fetch a score object from various data types."""
 
     @classmethod
-    async def from_sql(cls, score_id: int) -> Optional[Score]:
+    async def from_sql(cls, score_id: int) -> Score | None:
         """Create a score object from sql using its scoreid."""
         rec = await scores_repo.fetch_one(score_id)
 
@@ -188,7 +186,7 @@ class Score:
         s.pp = rec["pp"]
         s.score = rec["score"]
         s.max_combo = rec["max_combo"]
-        s.mods = rec["mods"]
+        s.mods = Mods(rec["mods"])
         s.acc = rec["acc"]
         s.n300 = rec["n300"]
         s.n100 = rec["n100"]
@@ -196,22 +194,15 @@ class Score:
         s.nmiss = rec["nmiss"]
         s.ngeki = rec["ngeki"]
         s.nkatu = rec["nkatu"]
-        s.grade = rec["grade"]
-        s.perfect = rec["perfect"]
-        s.status = rec["status"]
-        s.mode = rec["mode"]
+        s.grade = Grade.from_str(rec["grade"])
+        s.perfect = rec["perfect"] == 1
+        s.status = SubmissionStatus(rec["status"])
+        s.passed = s.status != SubmissionStatus.FAILED
+        s.mode = GameMode(rec["mode"])
         s.server_time = rec["play_time"]
         s.time_elapsed = rec["time_elapsed"]
-        s.client_flags = rec["client_flags"]
+        s.client_flags = ClientFlags(rec["client_flags"])
         s.client_checksum = rec["online_checksum"]
-
-        # fix some types
-        s.passed = s.status != 0
-        s.status = SubmissionStatus(s.status)
-        s.grade = Grade.from_str(s.grade)
-        s.mods = Mods(s.mods)
-        s.mode = GameMode(s.mode)
-        s.client_flags = ClientFlags(s.client_flags)
 
         if s.bmap:
             s.rank = await s.calculate_placement()
@@ -309,7 +300,7 @@ class Score:
             scoring_metric = "score"
             score = self.score
 
-        better_scores = await app.state.services.database.fetch_val(
+        num_better_scores: int | None = await app.state.services.database.fetch_val(
             "SELECT COUNT(*) AS c FROM scores s "
             "INNER JOIN users u ON u.id = s.userid "
             "WHERE s.map_md5 = :map_md5 AND s.mode = :mode "
@@ -322,11 +313,10 @@ class Score:
             },
             column=0,  # COUNT(*)
         )
+        assert num_better_scores is not None
+        return num_better_scores + 1
 
-        # TODO: idk if returns none
-        return better_scores + 1  # if better_scores is not None else 1
-
-    def calculate_performance(self, osu_file_path: Path) -> tuple[float, float]:
+    def calculate_performance(self, beatmap_id: int) -> tuple[float, float]:
         """Calculate PP and star rating for our score."""
         mode_vn = self.mode.as_vanilla
 
@@ -345,7 +335,7 @@ class Score:
         )
 
         result = app.usecases.performance.calculate_performances(
-            osu_file_path=str(osu_file_path),
+            osu_file_path=str(BEATMAPS_PATH / f"{beatmap_id}.osu"),
             scores=[score_args],
         )
 
