@@ -452,7 +452,7 @@ class SendMessage(BasePacket):
                         )
 
                         webhook = app.discord.Webhook(webhook_url, embeds=[embed])
-                        await webhook.post(app.state.services.http_client)
+                        await webhook.post()
 
                 else:
                     # time out their previous /np
