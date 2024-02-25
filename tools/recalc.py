@@ -121,8 +121,32 @@ async def recalculate_user(
     game_mode: GameMode,
     ctx: Context,
 ) -> None:
-    best_scores = await ctx.database.fetch_all(
-        "SELECT s.pp, s.acc FROM scores s "
+    # count the easy cumulative stats
+    accum_stats = await ctx.database.fetch_one(
+        "SELECT COUNT(*), SUM(time_elapsed), SUM(score), "
+        "  SUM(n300) + SUM(n100) + SUM(n50), "
+        "  SUM(ngeki) + SUM(nkatu) FROM scores "
+        "WHERE userid = :user_id AND mode = :mode",
+        {"user_id": id, "mode": game_mode}
+    )
+
+    new_stats = dict.fromkeys(
+        ("plays", "playtime", "tscore", "total_hits", "rscore", "acc", "pp"), 0
+    )
+
+    new_stats["plays"] = accum_stats["COUNT(*)"] or 0
+
+    if new_stats["plays"]:
+        new_stats["playtime"] = accum_stats["SUM(time_elapsed)"] // 1000
+        new_stats["tscore"] = accum_stats["SUM(score)"]
+        new_stats["total_hits"] = accum_stats["SUM(n300) + SUM(n100) + SUM(n50)"]
+
+        if game_mode.as_vanilla in (1, 3):
+            new_stats["total_hits"] += accum_stats["SUM(ngeki) + SUM(nkatu)"]
+
+    # then the weighted ranked stats
+    ranked_scores = await ctx.database.fetch_all(
+        "SELECT s.pp, s.acc, s.score FROM scores s "
         "INNER JOIN maps m ON s.map_md5 = m.md5 "
         "WHERE s.userid = :user_id AND s.mode = :mode "
         "AND s.status = 2 AND m.status IN (2, 3) "  # ranked, approved
@@ -130,25 +154,28 @@ async def recalculate_user(
         {"user_id": id, "mode": game_mode},
     )
 
-    total_scores = len(best_scores)
-    if not total_scores:
-        return
+    ranked_plays = len(ranked_scores)
 
-    top_100_pp = best_scores[:100]
+    if ranked_plays:  # without ranked plays, this divides by zero
+        new_stats["rscore"] = sum(row["score"] for i, row in enumerate(ranked_scores))
 
-    # calculate new total weighted accuracy
-    weighted_acc = sum(row["acc"] * 0.95**i for i, row in enumerate(top_100_pp))
-    bonus_acc = 100.0 / (20 * (1 - 0.95**total_scores))
-    acc = (weighted_acc * bonus_acc) / 100
+        # calculate new total weighted accuracy
+        weighted_acc = sum(row["acc"] * 0.95**i for i, row in enumerate(ranked_scores))
+        bonus_acc = 100.0 / (20 * (1 - 0.95**ranked_plays))
+        new_stats["acc"] = (weighted_acc * bonus_acc) / 100
 
-    # calculate new total weighted pp
-    weighted_pp = sum(row["pp"] * 0.95**i for i, row in enumerate(top_100_pp))
-    bonus_pp = 416.6667 * (1 - 0.9994**total_scores)
-    pp = round(weighted_pp + bonus_pp)
+        # calculate new total weighted pp
+        weighted_pp = sum(row["pp"] * 0.95**i for i, row in enumerate(ranked_scores))
+        bonus_pp = 416.6667 * (1 - 0.9994**ranked_plays)
+        new_stats["pp"] = round(weighted_pp + bonus_pp)
 
     await ctx.database.execute(
-        "UPDATE stats SET pp = :pp, acc = :acc WHERE id = :id AND mode = :mode",
-        {"pp": pp, "acc": acc, "id": id, "mode": game_mode},
+        "UPDATE stats SET pp = :pp, acc = :acc, "
+        "  plays = :plays, playtime = :playtime, "
+        "  tscore = :tscore, rscore = :rscore, "
+        "  total_hits = :total_hits "
+        "WHERE id = :id AND mode = :mode",
+        {**new_stats, "id": id, "mode": game_mode},
     )
 
     user_info = await ctx.database.fetch_one(
@@ -161,16 +188,20 @@ async def recalculate_user(
     if user_info["priv"] & Privileges.UNRESTRICTED:
         await ctx.redis.zadd(
             f"bancho:leaderboard:{game_mode.value}",
-            {str(id): pp},
+            {str(id): new_stats["pp"]},
         )
 
         await ctx.redis.zadd(
             f"bancho:leaderboard:{game_mode.value}:{user_info['country']}",
-            {str(id): pp},
+            {str(id): new_stats["pp"]},
         )
 
     if DEBUG:
-        print(f"Recalculated user ID {id} ({pp:.3f}pp, {acc:.3f}%)")
+        print(
+            f"Recalculated user ID {id} "
+            f"({new_stats['pp']:.3f}pp, "
+            f"{new_stats['acc']:.3f}%)"
+        )
 
 
 async def process_user_chunk(
@@ -244,7 +275,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "-m",
         "--mode",
-        nargs=argparse.ONE_OR_MORE,
+        nargs=argparse.OPTIONAL,
         required=False,
         default=["0", "1", "2", "3", "4", "5", "6", "8"],
         # would love to do things like "vn!std", but "!" will break interpretation
