@@ -18,3 +18,5 @@ tools/cf_records.txt
 poetry.toml
 .coverage
 backups/
+logging.yaml
+logs.log
