@@ -1,3 +1,5 @@
+name: osu-bancho
+
 services:
   ## shared services
   mysql:
@@ -93,6 +95,13 @@ services:
       - bancho-data:/.data:ro
     restart: unless-stopped
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel run
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+
 volumes:
   bancho-data:
     name: osu-bancho
@@ -100,3 +109,7 @@ volumes:
     name: osu-db
   redis-data:
     name: osu-redis
+
+networks:
+  default:
+    name: osu
