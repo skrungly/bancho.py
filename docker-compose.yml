@@ -1,4 +1,4 @@
-name: osu-bancho
+name: osu
 
 services:
   ## shared services
@@ -86,10 +86,6 @@ services:
 
   nginx:
     image: nginx:stable-alpine
-    ports:
-      - ${APP_PORT}:${APP_PORT}
-    depends_on:
-      - bancho
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - bancho-data:/.data:ro
