@@ -2,53 +2,65 @@
 # osu.ppy.sh is used for /web, /api, etc.
 # a.ppy.sh is used for osu! avatars
 
-upstream bancho {
-    server 127.0.0.1:${APP_PORT};
-}
-
 server {
-	listen 443 ssl;
-	server_name c.${DOMAIN} ce.${DOMAIN} c4.${DOMAIN} osu.${DOMAIN} b.${DOMAIN} api.${DOMAIN};
-	client_max_body_size 20M;
+	listen 80;
+	# XXX: you'll need to edit this to match your domain
+	server_name ~^(?:c[e4]?|osu|b|api)\.skrungly\.com$;
 
-	ssl_certificate     ${SSL_CERT_PATH};
-	ssl_certificate_key ${SSL_KEY_PATH};
-	ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:@SECLEVEL=1";
-
-	location / {
+	location /api/ {
 		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 		proxy_set_header X-Real-IP  $remote_addr;
 		proxy_set_header Host $http_host;
-		add_header Access-Control-Allow-Origin *;
 		proxy_redirect off;
+
+		# `127.0.0.11` is the default DNS server used by docker
+		# to get container addresses from their names. without
+		# this, nginx won't start if any of the services aren't
+		# already running.
+		resolver 127.0.0.11 valid=30s;
+		set $api flask;
+		rewrite /api/(.*) /$1 break;
+		proxy_pass http://$api;
+	}
+
+	location / {
+		add_header Access-Control-Allow-Origin *;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Real-IP  $remote_addr;
+		proxy_set_header Host $http_host;
+		proxy_redirect off;
+
 		proxy_pass http://bancho;
+
+		error_page 404 = @web;
+		proxy_intercept_errors on;
+	}
+
+	location @web {
+		resolver 127.0.0.11 valid=30s;
+		set $web web;
+		proxy_pass http://$web;
 	}
 }
 
 server {
-	listen 443 ssl;
-	server_name assets.${DOMAIN};
-
-	ssl_certificate     ${SSL_CERT_PATH};
-	ssl_certificate_key ${SSL_KEY_PATH};
-	ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:@SECLEVEL=1";
+	listen 80;
+	# XXX: you'll need to edit this to match your domain
+	server_name assets.skrungly.com;
 
 	location / {
 		default_type image/png;
-		root ${DATA_DIRECTORY}/assets;
+		root /.data/assets;
 	}
 }
 
 server {
-	listen 443 ssl;
-	server_name a.${DOMAIN};
-
-	ssl_certificate     ${SSL_CERT_PATH};
-	ssl_certificate_key ${SSL_KEY_PATH};
-	ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:@SECLEVEL=1";
+	listen 80;
+	# XXX: you'll need to edit this to match your domain
+	server_name a.skrungly.com;
 
 	location / {
-		root ${DATA_DIRECTORY}/avatars;
+		root /.data/avatars;
 		try_files $uri $uri.png $uri.jpg $uri.gif $uri.jpeg $uri.jfif /default.jpg = 404;
 	}
 }
