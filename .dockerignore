@@ -8,3 +8,4 @@ _testing/
 .pytest_cache/
 tools/cf_records.txt
 .env
+/backups/

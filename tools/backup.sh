@@ -11,7 +11,6 @@ fi
 
 # assigns DB_USER, DB_PASS, DB_NAME from .env
 eval "$(grep 'DB_.*=.*' .env)"
-COMPOSE_NAME=$(basename $(pwd))
 
 CATEGORY_DIR="./backups/$CATEGORY_NAME"
 BACKUP_DIR=$CATEGORY_DIR/$(date +%s)
@@ -19,17 +18,17 @@ mkdir -p "$BACKUP_DIR"
 
 echo "info: creating backup to $BACKUP_DIR..."
 echo "info: archiving bancho .data dir..."
-docker cp $COMPOSE_NAME-bancho-1:/srv/root/.data $BACKUP_DIR/.data
+docker cp osu-bancho-1:/srv/root/.data $BACKUP_DIR/.data
 
 echo "info: ensuring that mysql is running..."
-MYSQL_CONTAINER=$(docker ps -qf "name=${COMPOSE_NAME}-mysql-1")
+MYSQL_CONTAINER=$(docker ps -qf "name=osu-mysql-1")
 if [ -z $MYSQL_CONTAINER ]
   then
     docker compose up -d --wait mysql
 fi
 
 echo "info: dumping mysql tables..."
-docker exec -e MYSQL_PWD=$DB_PASS ${COMPOSE_NAME}-mysql-1 \
+docker exec -e MYSQL_PWD=$DB_PASS osu-mysql-1 \
     /usr/bin/mysqldump --no-tablespaces --single-transaction -u $DB_USER $DB_NAME \
     > "$BACKUP_DIR/backup.sql"
 

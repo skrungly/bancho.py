@@ -16,13 +16,12 @@ fi
 
 # assigns DB_USER, DB_PASS, DB_NAME from .env
 eval "$(grep 'DB_.*=.*' .env)"
-COMPOSE_NAME=$(basename $(pwd))
 
 echo "info: restoring from $BACKUP_TO_RESTORE..."
 docker compose down
 
 echo "info: deleting redis volume..."
-docker volume rm ${COMPOSE_NAME}_redis
+# docker volume rm osu-redis
 
 echo "info: starting mysql container..."
 docker compose up --wait mysql
@@ -32,11 +31,11 @@ docker compose exec -T -e MYSQL_PWD=$DB_PASS mysql \
     mysql -u $DB_USER $DB_NAME < $BACKUP_TO_RESTORE/backup.sql
 
 echo "info: intialising fresh bancho volume ..."
-docker volume rm ${COMPOSE_NAME}_data
+docker volume rm osu-bancho
 docker compose up --no-start bancho
 
 echo "info: restoring .data dir..."
-docker cp $BACKUP_TO_RESTORE/.data $COMPOSE_NAME-bancho-1:/srv/root/
+docker cp $BACKUP_TO_RESTORE/.data osu-bancho-1:/srv/root/
 
 docker compose down
 echo "info: done!"
