@@ -897,7 +897,7 @@ def user_stats(player: Player) -> bytes:
         (gm_stats.plays, osuTypes.i32),
         (gm_stats.tscore, osuTypes.i64),
         (gm_stats.rank, osuTypes.i32),
-        (pp if player.id != -1 else -1, osuTypes.i16),  # why not u16 peppy :(
+        (pp, osuTypes.i16),  # why not u16 peppy :(
     )
 
 

@@ -1153,32 +1153,26 @@ async def get_leaderboard_scores(
     scoring_metric: Literal["pp", "score"],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     query = [
-        f"SELECT s.id, t._score, "
+        f"SELECT s.id, s.{scoring_metric} AS _score, "
         "s.max_combo, s.n50, s.n100, s.n300, "
         "s.nmiss, s.nkatu, s.ngeki, s.perfect, s.mods, "
         "UNIX_TIMESTAMP(s.play_time) time, u.id userid, "
         "COALESCE(CONCAT('[', c.tag, '] ', u.name), u.name) AS name "
         "FROM scores s "
-        "INNER JOIN ("
-        f"   SELECT s.userid, MAX(s.{scoring_metric}) as _score "
-        "    FROM scores s "
-        "    WHERE s.map_md5 = :map_md5 AND s.status != 0 ",
-        "    AND s.mods = COALESCE(:mods, s.mods)"
-        "    GROUP BY s.userid "
-        f") t ON s.userid = t.userid AND s.score = t._score "
         "INNER JOIN users u ON u.id = s.userid "
         "LEFT JOIN clans c ON c.id = u.clan_id "
-        "WHERE s.mode = :mode AND s.map_md5 = :map_md5 AND (u.priv & 1 OR u.id = :user_id)"
+        "WHERE s.map_md5 = :map_md5 AND s.status = 2 "  # 2: =best score
+        "AND (u.priv & 1 OR u.id = :user_id) AND mode = :mode",
     ]
 
     params: dict[str, Any] = {
         "map_md5": map_md5,
         "user_id": player.id,
         "mode": mode,
-        "mods": None,
     }
 
     if leaderboard_type == LeaderboardType.Mods:
+        query.append("AND s.mods = :mods")
         params["mods"] = mods
     elif leaderboard_type == LeaderboardType.Friends:
         query.append("AND s.userid IN :friends")
