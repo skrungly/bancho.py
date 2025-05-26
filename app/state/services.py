@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import logging
 import pickle
@@ -27,7 +28,17 @@ from app.logging import log
 
 STRANGE_LOG_DIR = Path.cwd() / ".data/logs"
 
-VERSION_RGX = re.compile(r"^# v(?P<ver>\d+\.\d+\.\d+)$")
+VERSION_RGX = re.compile(
+    r"(?P<major>\d+)"
+    r"\.(?P<minor>\d+)"
+    r"\.(?P<micro>\d+)"
+)
+
+SERVER_VERSION_RGX = re.compile(
+    VERSION_RGX.pattern + rf"(?:\.(?P<extra>\d+))?"
+)
+
+MIGRATION_VERSION = re.compile(f"^# v({SERVER_VERSION_RGX.pattern})$")
 SQL_UPDATES_FILE = Path.cwd() / "migrations/migrations.sql"
 
 
@@ -279,11 +290,13 @@ async def log_strange_occurrence(obj: object) -> None:
 # dependency management
 
 
+@dataclasses.dataclass
 class Version:
-    def __init__(self, major: int, minor: int, micro: int) -> None:
-        self.major = major
-        self.minor = minor
-        self.micro = micro
+    major: int
+    minor: int
+    micro: int
+
+    _REGEX = VERSION_RGX
 
     def __repr__(self) -> str:
         return f"{self.major}.{self.minor}.{self.micro}"
@@ -310,20 +323,30 @@ class Version:
         return self.as_tuple >= other.as_tuple
 
     @property
-    def as_tuple(self) -> tuple[int, int, int]:
-        return (self.major, self.minor, self.micro)
+    def as_tuple(self) -> tuple:
+        return dataclasses.astuple(self)
 
     @classmethod
     def from_str(cls, s: str) -> Version | None:
-        split = s.split(".")
-        if len(split) == 3:
-            return cls(
-                major=int(split[0]),
-                minor=int(split[1]),
-                micro=int(split[2]),
-            )
+        if (match := cls._REGEX.match(s)):
+            values = {k: int(v or 0) for k, v in match.groupdict().items()}
+            return cls(**values)
 
         return None
+
+
+@dataclasses.dataclass
+class ServerVersion(Version):
+    extra: int = 0
+
+    _REGEX = SERVER_VERSION_RGX
+
+    def __repr__(self) -> str:
+        ver_str = f"{self.major}.{self.minor}.{self.micro}"
+        if self.extra:
+            ver_str += f".{self.extra}"
+
+        return ver_str
 
 
 async def _get_latest_dependency_versions() -> AsyncGenerator[
@@ -386,37 +409,58 @@ async def check_for_dependency_updates() -> None:
 # sql migrations
 
 
-async def _get_current_sql_structure_version() -> Version | None:
+async def _enable_custom_versions() -> None:
+    """Ensure that `startups` table has a `ver_extra` column."""
+    column = await app.state.services.database.fetch_one(
+        "SHOW COLUMNS FROM startups LIKE 'ver_extra'"
+    )
+
+    if column is None:
+        log(f"Updating mysql structure (for custom versions).", Ansi.LMAGENTA)
+
+        try:
+            await app.state.services.database.execute(
+                "ALTER TABLE startups ADD ver_extra TINYINT DEFAULT 0 NOT NULL AFTER ver_micro"
+            )
+        except pymysql.err.MySQLError as exc:
+            log("Failed to add custom version column to `startups` table.", Ansi.LRED)
+            raise KeyboardInterrupt from exc
+
+
+async def _get_current_sql_structure_version() -> ServerVersion | None:
     """Get the last launched version of the server."""
     res = await app.state.services.database.fetch_one(
-        "SELECT ver_major, ver_minor, ver_micro "
+        "SELECT ver_major, ver_minor, ver_micro, ver_extra "
         "FROM startups ORDER BY datetime DESC LIMIT 1",
     )
 
     if res:
-        return Version(res["ver_major"], res["ver_minor"], res["ver_micro"])
+        return ServerVersion(
+            res["ver_major"],
+            res["ver_minor"],
+            res["ver_micro"],
+            res["ver_extra"],
+        )
 
     return None
 
 
 async def run_sql_migrations() -> None:
     """Update the sql structure, if it has changed."""
-    software_version = Version.from_str(app.settings.VERSION)
+    software_version = ServerVersion.from_str(app.settings.VERSION)
     if software_version is None:
         raise RuntimeError(f"Invalid bancho.py version '{app.settings.VERSION}'")
+
+    await _enable_custom_versions()
 
     last_run_migration_version = await _get_current_sql_structure_version()
     if not last_run_migration_version:
         # Migrations have never run before - this is the first time starting the server.
         # We'll insert the current version into the database, so future versions know to migrate.
         await app.state.services.database.execute(
-            "INSERT INTO startups (ver_major, ver_minor, ver_micro, datetime) "
-            "VALUES (:major, :minor, :micro, NOW())",
-            {
-                "major": software_version.major,
-                "minor": software_version.minor,
-                "micro": software_version.micro,
-            },
+            "INSERT INTO startups (ver_major, ver_minor, ver_micro, ver_extra, datetime) "
+            "VALUES (:major, :minor, :micro, :extra, NOW())",
+            dataclasses.asdict(software_version)
         )
         return  # already up to date (server has never run before)
 
@@ -437,9 +481,9 @@ async def run_sql_migrations() -> None:
 
         if line.startswith("#"):
             # may be normal comment or new version
-            r_match = VERSION_RGX.fullmatch(line)
+            r_match = MIGRATION_VERSION.fullmatch(line)
             if r_match:
-                update_ver = Version.from_str(r_match["ver"])
+                update_ver = ServerVersion.from_str(r_match.group(1))
 
             continue
         elif not update_ver:
@@ -482,11 +526,7 @@ async def run_sql_migrations() -> None:
     else:
         # all queries executed successfully
         await app.state.services.database.execute(
-            "INSERT INTO startups (ver_major, ver_minor, ver_micro, datetime) "
-            "VALUES (:major, :minor, :micro, NOW())",
-            {
-                "major": software_version.major,
-                "minor": software_version.minor,
-                "micro": software_version.micro,
-            },
+            "INSERT INTO startups (ver_major, ver_minor, ver_micro, ver_extra, datetime) "
+            "VALUES (:major, :minor, :micro, :extra, NOW())",
+            dataclasses.asdict(software_version)
         )

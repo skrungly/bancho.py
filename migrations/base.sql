@@ -264,6 +264,7 @@ create table startups
 	ver_major tinyint not null,
 	ver_minor tinyint not null,
 	ver_micro tinyint not null,
+	ver_extra tinyint not null,
 	datetime datetime not null
 );
 
