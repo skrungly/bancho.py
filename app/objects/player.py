@@ -303,7 +303,7 @@ class Player:
     @property
     def url(self) -> str:
         """The url to the player's profile."""
-        return f"https://{app.settings.DOMAIN}/u/{self.id}"
+        return f"https://osu.{app.settings.DOMAIN}/u/{self.id}"
 
     @property
     def embed(self) -> str:
