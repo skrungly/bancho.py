@@ -433,7 +433,7 @@ class SendMessage(BasePacket):
                         )
 
                         diff_str = f"{bmap.diff:.02f}*"
-                        duration_str = f"{bmap.total_length // 60}:{bmap.total_length % 60}"
+                        duration_str = f"{bmap.total_length // 60}:{bmap.total_length % 60:02}"
                         mode_str = repr(GameMode(mode_vn)).replace("vn", "osu")
 
                         fields = [
