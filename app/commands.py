@@ -4,6 +4,7 @@ import importlib.metadata
 import os
 import pprint
 import random
+import re
 import secrets
 import signal
 import time
@@ -564,6 +565,37 @@ async def apikey(ctx: Context) -> str | None:
     app.state.sessions.api_keys[ctx.player.api_key] = ctx.player.id
 
     return f"API key generated. Copy your api key from (this url)[http://{ctx.player.api_key}]."
+
+
+@command(Privileges.UNRESTRICTED)
+async def rate(ctx: Context) -> str | None:
+    """Generate custom rates of the most recently /np'ed map."""
+    RATE_REGEX = re.compile(r"\d+(?:.\d+)(?:x|bpm)")
+
+    has_errors = False
+    for arg in ctx.args:
+        if not RATE_REGEX.match(arg):
+            has_errors = True
+            break
+
+    if len(ctx.args) == 0 or has_errors:
+        return "Invalid syntax: !rate <bpm/multiplier> ..."
+
+    if ctx.player.last_np is None or time.time() >= ctx.player.last_np["timeout"]:
+        return "Please /np a map first!"
+
+    bmap = ctx.player.last_np["bmap"]
+    api_url = (
+        f"https://osu.{app.settings.DOMAIN}"
+        f"/api/maps/{bmap.id}/download"
+        f"?rate={'&rate='.join(ctx.args)}"
+    )
+
+    return (
+        f"Click (here)[{api_url}] to download the modified mapset! "
+        "The request may take a while, especially for multiple rates. "
+        "There is no limit, but please be nice! :D"
+    )
 
 
 """ Nominator commands
