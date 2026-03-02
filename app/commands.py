@@ -601,7 +601,7 @@ async def rate(ctx: Context) -> str | None:
 
     return (
         f"Click (here)[{monitor_url}] to download the modified mapset! "
-        "Generated using (cosu-trainer)[{https://github.com/hwsmm/cosutrainer}].
+        "Generated using (cosu-trainer)[https://github.com/hwsmm/cosutrainer]."
     )
 
 
