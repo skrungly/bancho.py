@@ -52,6 +52,10 @@ server {
 		default_type image/png;
 		root /.data/assets;
 	}
+
+	location /osz/ {
+		root /.data/;
+	}
 }
 
 server {

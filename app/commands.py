@@ -585,16 +585,23 @@ async def rate(ctx: Context) -> str | None:
         return "Please /np a map first!"
 
     bmap = ctx.player.last_np["bmap"]
-    api_url = (
-        f"https://osu.{app.settings.DOMAIN}"
-        f"/api/maps/{bmap.id}/download"
-        f"?rate={'&rate='.join(ctx.args)}"
+
+    response = await app.state.services.http_client.get(
+        f"https://osu.{app.settings.DOMAIN}/api/maps/{bmap.id}/download",
+        params={
+            "rate": ctx.args
+        }
     )
 
+    if response.status_code != 202:
+        return f"An error occurred while processing the request [{response.status_code}]"
+
+    task_info = response.json()
+    monitor_url = f"https://osu.{app.settings.DOMAIN}/tasks/{task_info['task']}"
+
     return (
-        f"Click (here)[{api_url}] to download the modified mapset! "
-        "The request may take a while, especially for multiple rates. "
-        "There is no limit, but please be nice! :D"
+        f"Click (here)[{monitor_url}] to download the modified mapset! "
+        "Generated using (cosu-trainer)[{https://github.com/hwsmm/cosutrainer}].
     )
 
 
